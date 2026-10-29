@@ -138,7 +138,6 @@ const SHIM = `(function () {
     return P + a;
   }
 
-  // ---------------- log overlay ----------------
   var box = null, list = null, lines = [], count = 0;
 
   function store(k, v) { try { localStorage.setItem(k, v); } catch (e) {} }
@@ -181,24 +180,27 @@ const SHIM = `(function () {
     }
   }
 
-  var PROBE_URLS = [
-    'https://pcs.geforcenow.com/v1/serviceUrls',
-    'https://apps.gxn.nvidia.com/graphql',
-    'https://gx-target-experiments-frontend-api.gx.nvidia.com/cloudvariables/v3'
-  ];
-
   function runProbe(b) {
     b.textContent = 'RUNNING';
+    var urls = [
+      'https://pcs.geforcenow.com/v1/serviceUrls',
+      'https://apps.gxn.nvidia.com/graphql',
+      'https://gx-target-experiments-frontend-api.gx.nvidia.com/cloudvariables/v3'
+    ];
     var i = 0;
     (function step() {
-      if (i >= PROBE_URLS.length) { b.textContent = 'PROBE'; return; }
-      var u = PROBE_URLS[i++];
+      if (i >= urls.length) { b.textContent = 'PROBE'; return; }
+      var u = urls[i++];
       fetch('/__probe?u=' + encodeURIComponent(u))
         .then(function (r) { return r.text(); })
         .then(function (t) { log('probe', u, '\\n  ' + t.replace(/\\n/g, '\\n  ')); })
         .catch(function (e) { log('probe', u, 'ERR ' + e.message); })
         .then(step);
     })();
+    fetch('/__proxytest?u=' + encodeURIComponent(urls[0]))
+      .then(function (r) { return r.text(); })
+      .then(function (t) { log('pxtest', urls[0], '\\n  ' + t.replace(/\\n/g, '\\n  ')); })
+      .catch(function (e) { log('pxtest', urls[0], 'ERR ' + e.message); });
   }
 
   function overlay() {
@@ -256,7 +258,6 @@ const SHIM = `(function () {
 
   function ref() { try { return base(); } catch (e) { return ''; } }
 
-  // ---------------- network hooks ----------------
   var of = window.fetch;
   window.fetch = function (input, init) {
     var target = typeof input === 'string' || input instanceof URL ? String(input) : (input && input.url);
@@ -347,7 +348,7 @@ const SHIM = `(function () {
 const LOG = [];
 function pushLog(o) {
   LOG.push(o);
-  if (LOG.length > 300) LOG.shift();
+  if (LOG.length > 400) LOG.shift();
 }
 
 function normalizeTarget(raw, selfHost) {
@@ -413,6 +414,7 @@ function proxyFor(origin) {
 
   const mw = createProxyMiddleware({
     target: origin,
+    pathFilter: () => true,
     changeOrigin: true,
     ws: true,
     secure: true,
@@ -435,7 +437,6 @@ function proxyFor(origin) {
       ]) {
         proxyReq.removeHeader(k);
       }
-      // 宛先ホストを明示的に固定する（ここが崩れると Akamai=404 / CloudFront=403 になる）
       proxyReq.setHeader('host', targetHost);
       proxyReq.setHeader('accept-encoding', 'gzip, deflate, br');
       proxyReq.setHeader('origin', ORIGIN);
@@ -443,6 +444,9 @@ function proxyFor(origin) {
       proxyReq.removeHeader('x-gfn-ref');
       proxyReq.removeHeader('if-none-match');
       proxyReq.removeHeader('if-modified-since');
+
+      // 実際に送った内容を記録する
+      pushLog({ t: Date.now(), sent: `${req.method} https://${targetHost}${req.url}` });
     },
 
     onProxyRes(proxyRes, req, res) {
@@ -550,7 +554,7 @@ function probeOnce(url, method, body, headers) {
             if (/^(server|via|x-cache|x-amz|akamai|cf-|x-akamai|x-served|x-nv|content-type)/i.test(k))
               keep[k] = resp.headers[k];
           }
-          resolve({ status: resp.statusCode, headers: keep, body: b.toString('utf8').slice(0, 900) });
+          resolve({ status: resp.statusCode, headers: keep, body: b.toString('utf8').slice(0, 700) });
         });
       }
     );
@@ -597,7 +601,7 @@ function probeH2(url, method, body, headers) {
       });
       r.on('data', (d) => chunks.push(d));
       r.on('end', () =>
-        done({ status, headers: hdrs, body: Buffer.concat(chunks).toString('utf8').slice(0, 700) })
+        done({ status, headers: hdrs, body: Buffer.concat(chunks).toString('utf8').slice(0, 600) })
       );
       r.on('error', (e) => done({ error: e.message }));
       if (body) r.write(body);
@@ -606,10 +610,45 @@ function probeH2(url, method, body, headers) {
   });
 }
 
+function probeLocal(path, headers) {
+  return new Promise((resolve) => {
+    const r = http.request(
+      { hostname: '127.0.0.1', port: PORT, path, method: 'GET', timeout: 20000, headers },
+      (resp) => {
+        const chunks = [];
+        resp.on('data', (c) => chunks.push(c));
+        resp.on('end', () =>
+          resolve({
+            status: resp.statusCode,
+            contentType: resp.headers['content-type'],
+            body: Buffer.concat(chunks).toString('utf8').slice(0, 400),
+          })
+        );
+      }
+    );
+    r.on('error', (e) => resolve({ error: e.message }));
+    r.on('timeout', () => {
+      r.destroy();
+      resolve({ error: 'timeout' });
+    });
+    r.end();
+  });
+}
+
 const app = express();
 app.disable('x-powered-by');
 app.disable('etag');
 app.set('trust proxy', true);
+
+app.use((req, res, next) => {
+  if (!req.path.startsWith('/__')) return next();
+  if (!process.env.BASIC_USER || !process.env.BASIC_PASS) return next();
+  const auth = req.headers.authorization || '';
+  const [u, p] = Buffer.from(auth.replace(/^Basic\s+/i, ''), 'base64').toString().split(':');
+  if (u === process.env.BASIC_USER && p === process.env.BASIC_PASS) return next();
+  res.writeHead(401, { 'www-authenticate': 'Basic realm="gfn"' });
+  res.end('Auth required');
+});
 
 if (process.env.BASIC_USER && process.env.BASIC_PASS) {
   app.use((req, res, next) => {
@@ -625,7 +664,7 @@ app.get('/__health', (req, res) => res.type('text/plain').send('ok'));
 
 app.get('/__log', (req, res) => {
   res.type('application/json');
-  res.send(JSON.stringify(LOG.slice(-100), null, 2));
+  res.send(JSON.stringify(LOG.slice(-80), null, 2));
 });
 
 app.get('/__shim.js', (req, res) => {
@@ -652,6 +691,14 @@ app.get('/__selftest', async (req, res) => {
       2
     )
   );
+});
+
+// サーバー内から自前のプロキシ経路を叩く（ミドルウェアが素通りしていないかの検査）
+app.get('/__proxytest', async (req, res) => {
+  const u = String(req.query.u || 'https://pcs.geforcenow.com/v1/serviceUrls');
+  const r = await probeLocal('/__p/' + u, { accept: '*/*', 'user-agent': UA });
+  res.type('application/json');
+  res.send(JSON.stringify({ url: u, result: r, recent: LOG.slice(-6) }, null, 2));
 });
 
 app.get('/__probe', async (req, res) => {
@@ -694,12 +741,16 @@ app.use(PREFIX, (req, res, next) => {
   if (!shouldProxy(target.href)) return res.status(403).type('text/plain').send('Not proxied: ' + target.host);
   req.__target = target.href;
   req.url = target.pathname + target.search;
-  return proxyFor(target.origin)(req, res, next);
+
+  return proxyFor(target.origin)(req, res, () => {
+    pushLog({ t: Date.now(), fellThrough: req.__target });
+    return proxyFor(ORIGIN)(req, res, () => res.status(502).type('text/plain').send('no handler'));
+  });
 });
 
 app.use((req, res, next) => {
   req.__target = ORIGIN + req.originalUrl;
-  return proxyFor(ORIGIN)(req, res, next);
+  return proxyFor(ORIGIN)(req, res, () => res.status(502).type('text/plain').send('no handler'));
 });
 
 const server = http.createServer(app);
