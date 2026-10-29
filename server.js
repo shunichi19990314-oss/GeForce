@@ -11,7 +11,6 @@ const ORIGIN = 'https://play.geforcenow.com';
 const ORIGIN_HOST = new URL(ORIGIN).host;
 const PREFIX = '/__p/';
 
-// https は基本的に全部プロキシする（クロスオリジンを作らないため）
 const BLOCK_RE = /(^|\.)(doubleclick\.net|googletagmanager\.com|google-analytics\.com)$/i;
 
 function shouldProxy(abs) {
@@ -92,7 +91,12 @@ function rewriteHtml(html, base) {
 
   $('script[integrity], link[integrity]').removeAttr('integrity');
   $('*[crossorigin]').removeAttr('crossorigin');
-  $('head').prepend('<script src="/__shim.js"></script>');
+
+  // 本来のドキュメントURLをシムへ渡す（相対URL解決の基準）
+  $('head').prepend(
+    `<script>window.__GFN_DOC__=${JSON.stringify(base)};</script>` +
+      '<script src="/__shim.js"></script>'
+  );
 
   return $.html();
 }
@@ -110,10 +114,13 @@ const SHIM = `(function () {
   var OH = ${JSON.stringify(ORIGIN_HOST)};
   var BLOCK = new RegExp(${JSON.stringify(BLOCK_RE.source)}, 'i');
 
+  // 相対URLの解決基準は「本来のドキュメントURL」。
+  // 無ければ現在地から復元する（プロキシ自身のオリジンには解決させない）。
   function base() {
+    if (window.__GFN_DOC__) return window.__GFN_DOC__;
     var p = location.pathname + location.search + location.hash;
     if (p.indexOf(P) === 0) return p.slice(P.length);
-    return location.origin + p;
+    return ${JSON.stringify(ORIGIN)} + p;
   }
 
   function map(u) {
@@ -126,11 +133,11 @@ const SHIM = `(function () {
     if (!/^https:/i.test(a)) return u;
     var url = new URL(a);
     if (BLOCK.test(url.hostname)) return u;
+    if (url.host === location.host) return url.pathname + url.search + url.hash;
     if (url.host === OH) return url.pathname + url.search + url.hash;
     return P + a;
   }
 
-  // ---- debug overlay ----
   var box = null, count = 0;
   function overlay() {
     if (box) return box;
@@ -142,12 +149,11 @@ const SHIM = `(function () {
   }
   function log(kind, url, extra) {
     if (count++ > 200) return;
-    var line = '[' + kind + '] ' + (extra || '') + ' ' + String(url).replace(location.origin, '');
+    var line = '[' + kind + '] ' + (extra || '') + ' ' + String(url);
     (overlay().appendChild(document.createElement('div'))).textContent = line;
     console.warn('GFN-PROXY', line);
   }
 
-  // ---- network hooks ----
   var of = window.fetch;
   window.fetch = function (input, init) {
     var target = typeof input === 'string' || input instanceof URL ? String(input) : (input && input.url);
@@ -214,7 +220,7 @@ const SHIM = `(function () {
     if (document.readyState === 'loading')
       document.addEventListener('DOMContentLoaded', overlay);
     else overlay();
-    log('init', location.href, 'debug on');
+    log('init', window.__GFN_DOC__ || location.href, 'debug on');
   }
 })();`;
 
@@ -222,6 +228,44 @@ const LOG = [];
 function pushLog(o) {
   LOG.push(o);
   if (LOG.length > 300) LOG.shift();
+}
+
+/**
+ * 受け取った生パスを正規化する。
+ * - プロキシ自身のホストを指していたらパスに畳む
+ * - 先頭の /__p/ が二重三重に付いていたら剥がす
+ * - スキーム無しは ORIGIN 配下のパスとして扱う
+ */
+function normalizeTarget(raw, selfHost) {
+  let cur = String(raw || '').trim();
+  for (let i = 0; i < 4; i++) {
+    let u;
+    if (/^https?:\/\//i.test(cur)) {
+      try {
+        u = new URL(cur);
+      } catch {
+        return null;
+      }
+    } else {
+      try {
+        u = new URL(ORIGIN + (cur.startsWith('/') ? cur : '/' + cur));
+      } catch {
+        return null;
+      }
+    }
+
+    if (u.host.toLowerCase() === selfHost) {
+      cur = u.pathname + u.search;
+      continue;
+    }
+    if (u.pathname.startsWith(PREFIX)) {
+      cur = u.pathname.slice(PREFIX.length) + u.search;
+      continue;
+    }
+    if (u.protocol !== 'https:') return null;
+    return u;
+  }
+  return null;
 }
 
 const proxyCache = new Map();
@@ -243,7 +287,6 @@ function proxyFor(origin) {
 
     onProxyReq(proxyReq, req) {
       proxyReq.setHeader('accept-encoding', 'identity');
-      // 実ブラウザと同じ組み合わせに固定する
       proxyReq.setHeader('origin', ORIGIN);
       proxyReq.setHeader('referer', ORIGIN + '/');
       proxyReq.removeHeader('if-none-match');
@@ -342,11 +385,9 @@ app.get('/__shim.js', (req, res) => {
 });
 
 app.use(PREFIX, (req, res, next) => {
-  const raw = req.originalUrl.slice(PREFIX.length);
-  let target;
-  try {
-    target = new URL(raw);
-  } catch {
+  const selfHost = String(req.headers.host || '').toLowerCase();
+  const target = normalizeTarget(req.originalUrl.slice(PREFIX.length), selfHost);
+  if (!target) {
     return res.status(400).type('text/plain').send('Bad URL');
   }
   if (!shouldProxy(target.href)) {
@@ -365,13 +406,11 @@ app.use((req, res, next) => {
 const server = http.createServer(app);
 
 server.on('upgrade', (req, socket, head) => {
+  const selfHost = String(req.headers.host || '').toLowerCase();
   let target;
   if (req.url.startsWith(PREFIX)) {
-    try {
-      target = new URL(req.url.slice(PREFIX.length));
-    } catch {
-      return socket.destroy();
-    }
+    target = normalizeTarget(req.url.slice(PREFIX.length), selfHost);
+    if (!target) return socket.destroy();
     req.url = target.pathname + target.search;
   } else {
     target = new URL(req.url, ORIGIN);
