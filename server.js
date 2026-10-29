@@ -11,37 +11,18 @@ const ORIGIN = 'https://play.geforcenow.com';
 const ORIGIN_HOST = new URL(ORIGIN).host;
 const PREFIX = '/__p/';
 
-// プロキシを許可するホスト（サフィックス一致）
-const ALLOW = (
-  process.env.ALLOW_HOSTS ||
-  'geforcenow.com,nvidia.com,nvidiagrid.net,nvidiagrid.com,akamaihd.net,akamaized.net'
-)
-  .split(',')
-  .map((s) => s.trim().toLowerCase())
-  .filter(Boolean);
+// https は基本的に全部プロキシする（クロスオリジンを作らないため）
+const BLOCK_RE = /(^|\.)(doubleclick\.net|googletagmanager\.com|google-analytics\.com)$/i;
 
-const ALLOW_RE = new RegExp(
-  '^https://([a-z0-9-]+\\.)*(' +
-    ALLOW.map((s) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('|') +
-    ')(/|$)',
-  'i'
-);
-
-function isAllowed(abs) {
+function shouldProxy(abs) {
   try {
     const u = new URL(abs);
-    return u.protocol === 'https:' && ALLOW_RE.test(u.href);
+    return u.protocol === 'https:' && !BLOCK_RE.test(u.hostname);
   } catch {
     return false;
   }
 }
 
-/**
- * 元ページの base を基準にURLを解決し、プロキシ用の形に変換する。
- *  - 元オリジンと同じホスト  -> ルート絶対パス（/ プロキシが拾う）
- *  - 許可ホスト（別オリジン） -> /__p/https://host/path
- *  - それ以外               -> 絶対URLのまま（直接アクセス）
- */
 function mapUrl(value, base) {
   if (value == null) return value;
   const v = String(value).trim();
@@ -55,7 +36,7 @@ function mapUrl(value, base) {
   }
 
   if (!/^https:/i.test(abs)) return abs;
-  if (!isAllowed(abs)) return abs;
+  if (!shouldProxy(abs)) return abs;
 
   const u = new URL(abs);
   if (u.host === ORIGIN_HOST) return u.pathname + u.search + u.hash;
@@ -109,11 +90,8 @@ function rewriteHtml(html, base) {
     if (m) $(el).attr('content', c.replace(m[1], mapUrl(m[1].trim(), base)));
   });
 
-  // サブリソース整合性はプロキシ後に崩れるので外す
   $('script[integrity], link[integrity]').removeAttr('integrity');
   $('*[crossorigin]').removeAttr('crossorigin');
-
-  // シムを最優先で読み込ませる
   $('head').prepend('<script src="/__shim.js"></script>');
 
   return $.html();
@@ -129,8 +107,8 @@ const SHIM = `(function () {
   if (window.__GFN_SHIM__) return;
   window.__GFN_SHIM__ = true;
   var P = ${JSON.stringify(PREFIX)};
-  var ORIGIN = ${JSON.stringify(ORIGIN)};
-  var RE = new RegExp(${JSON.stringify(ALLOW_RE.source)}, 'i');
+  var OH = ${JSON.stringify(ORIGIN_HOST)};
+  var BLOCK = new RegExp(${JSON.stringify(BLOCK_RE.source)}, 'i');
 
   function base() {
     var p = location.pathname + location.search + location.hash;
@@ -146,29 +124,59 @@ const SHIM = `(function () {
     try { a = new URL(s, base()).href; } catch (e) { return u; }
     if (a.indexOf(location.origin + P) === 0) return a.slice(location.origin.length);
     if (!/^https:/i.test(a)) return u;
-    if (!RE.test(a)) return u;
     var url = new URL(a);
-    if (url.host === new URL(ORIGIN).host) return url.pathname + url.search + url.hash;
+    if (BLOCK.test(url.hostname)) return u;
+    if (url.host === OH) return url.pathname + url.search + url.hash;
     return P + a;
   }
 
+  // ---- debug overlay ----
+  var box = null, count = 0;
+  function overlay() {
+    if (box) return box;
+    box = document.createElement('div');
+    box.style.cssText = 'position:fixed;z-index:2147483647;right:8px;bottom:8px;width:min(560px,90vw);max-height:45vh;overflow:auto;background:#000d;color:#0f0;font:11px/1.4 monospace;padding:8px;border:1px solid #0f0;border-radius:6px;white-space:pre-wrap';
+    box.addEventListener('click', function () { box.remove(); box = null; });
+    document.documentElement.appendChild(box);
+    return box;
+  }
+  function log(kind, url, extra) {
+    if (count++ > 200) return;
+    var line = '[' + kind + '] ' + (extra || '') + ' ' + String(url).replace(location.origin, '');
+    (overlay().appendChild(document.createElement('div'))).textContent = line;
+    console.warn('GFN-PROXY', line);
+  }
+
+  // ---- network hooks ----
   var of = window.fetch;
   window.fetch = function (input, init) {
-    if (typeof input === 'string' || input instanceof URL) input = map(String(input));
-    else if (input && input.url) input = new Request(map(input.url), input);
-    return of.call(this, input, init);
+    var target = typeof input === 'string' || input instanceof URL ? String(input) : (input && input.url);
+    var mapped = map(target);
+    if (typeof input === 'string' || input instanceof URL) input = mapped;
+    else if (input && input.url) input = new Request(mapped, input);
+    return of.call(this, input, init).then(
+      function (r) { if (r.status >= 400) log('fetch', mapped, r.status); return r; },
+      function (e) { log('fetch', mapped, 'ERR ' + e.message); throw e; }
+    );
   };
 
   var xo = XMLHttpRequest.prototype.open;
   XMLHttpRequest.prototype.open = function (m, u) {
     var args = [].slice.call(arguments);
-    args[1] = map(u);
+    var mapped = map(u);
+    args[1] = mapped;
+    this.addEventListener('loadend', function () {
+      if (this.status === 0 || this.status >= 400) log('xhr', mapped, this.status || 'ERR');
+    });
     return xo.apply(this, args);
   };
 
   var OWS = window.WebSocket;
   function WSP(url, protocols) {
-    return protocols === undefined ? new OWS(map(url)) : new OWS(map(url), protocols);
+    var mapped = map(url);
+    var ws = protocols === undefined ? new OWS(mapped) : new OWS(mapped, protocols);
+    ws.addEventListener('error', function () { log('ws', mapped, 'ERR'); });
+    return ws;
   }
   WSP.prototype = OWS.prototype;
   ['CONNECTING', 'OPEN', 'CLOSING', 'CLOSED'].forEach(function (k) { WSP[k] = OWS[k]; });
@@ -176,7 +184,12 @@ const SHIM = `(function () {
 
   var OES = window.EventSource;
   if (OES) {
-    function ES(url, cfg) { return new OES(map(url), cfg); }
+    function ES(url, cfg) {
+      var mapped = map(url);
+      var es = new OES(mapped, cfg);
+      es.addEventListener('error', function () { log('sse', mapped, 'ERR'); });
+      return es;
+    }
     ES.prototype = OES.prototype;
     window.EventSource = ES;
   }
@@ -195,7 +208,21 @@ const SHIM = `(function () {
     var ob = navigator.sendBeacon.bind(navigator);
     navigator.sendBeacon = function (u, d) { return ob(map(u), d); };
   }
+
+  if (/[?&]debug=1/.test(location.href) || localStorage.getItem('gfnDebug') === '1') {
+    localStorage.setItem('gfnDebug', '1');
+    if (document.readyState === 'loading')
+      document.addEventListener('DOMContentLoaded', overlay);
+    else overlay();
+    log('init', location.href, 'debug on');
+  }
 })();`;
+
+const LOG = [];
+function pushLog(o) {
+  LOG.push(o);
+  if (LOG.length > 300) LOG.shift();
+}
 
 const proxyCache = new Map();
 
@@ -215,13 +242,10 @@ function proxyFor(origin) {
     timeout: 180000,
 
     onProxyReq(proxyReq, req) {
-      // 圧縮を切って本文を書き換えられるようにする
       proxyReq.setHeader('accept-encoding', 'identity');
-      try {
-        const t = new URL(req.__target || ORIGIN);
-        proxyReq.setHeader('origin', t.origin);
-        proxyReq.setHeader('referer', t.origin + '/');
-      } catch {}
+      // 実ブラウザと同じ組み合わせに固定する
+      proxyReq.setHeader('origin', ORIGIN);
+      proxyReq.setHeader('referer', ORIGIN + '/');
       proxyReq.removeHeader('if-none-match');
       proxyReq.removeHeader('if-modified-since');
     },
@@ -240,11 +264,11 @@ function proxyFor(origin) {
         delete h[k];
       }
 
-      if (h.location) {
-        h.location = mapUrl(h.location, req.__target || ORIGIN);
-      }
+      if (h.location) h.location = mapUrl(h.location, req.__target || ORIGIN);
 
       const status = proxyRes.statusCode || 200;
+      if (status >= 400) pushLog({ t: Date.now(), status, url: req.__target });
+
       const ct = String(h['content-type'] || '').toLowerCase();
       const isHtml = ct.includes('text/html');
       const isCss = ct.includes('text/css');
@@ -275,6 +299,7 @@ function proxyFor(origin) {
     },
 
     onError(err, req, res) {
+      pushLog({ t: Date.now(), error: err.message, url: req.__target });
       if (res && !res.headersSent && res.writeHead) {
         res.writeHead(502, { 'content-type': 'text/plain; charset=utf-8' });
         res.end('Proxy error: ' + err.message);
@@ -290,9 +315,9 @@ function proxyFor(origin) {
 
 const app = express();
 app.disable('x-powered-by');
+app.disable('etag');
 app.set('trust proxy', true);
 
-// 任意の Basic 認証（URL を知られても大丈夫なように）
 if (process.env.BASIC_USER && process.env.BASIC_PASS) {
   app.use((req, res, next) => {
     const auth = req.headers.authorization || '';
@@ -304,13 +329,18 @@ if (process.env.BASIC_USER && process.env.BASIC_PASS) {
 }
 
 app.get('/__health', (req, res) => res.type('text/plain').send('ok'));
+
+app.get('/__log', (req, res) => {
+  res.type('application/json');
+  res.send(JSON.stringify(LOG.slice(-100), null, 2));
+});
+
 app.get('/__shim.js', (req, res) => {
   res.type('application/javascript; charset=utf-8');
   res.setHeader('cache-control', 'no-cache');
   res.send(SHIM);
 });
 
-// 任意ホスト用プロキシ
 app.use(PREFIX, (req, res, next) => {
   const raw = req.originalUrl.slice(PREFIX.length);
   let target;
@@ -319,16 +349,14 @@ app.use(PREFIX, (req, res, next) => {
   } catch {
     return res.status(400).type('text/plain').send('Bad URL');
   }
-  const abs = target.href;
-  if (!isAllowed(abs)) {
-    return res.status(403).type('text/plain').send('Host not allowed: ' + target.host);
+  if (!shouldProxy(target.href)) {
+    return res.status(403).type('text/plain').send('Not proxied: ' + target.host);
   }
-  req.__target = abs;
+  req.__target = target.href;
   req.url = target.pathname + target.search;
   return proxyFor(target.origin)(req, res, next);
 });
 
-// 本体（すべて play.geforcenow.com へ）
 app.use((req, res, next) => {
   req.__target = ORIGIN + req.originalUrl;
   return proxyFor(ORIGIN)(req, res, next);
@@ -348,12 +376,9 @@ server.on('upgrade', (req, socket, head) => {
   } else {
     target = new URL(req.url, ORIGIN);
   }
-  const abs = target.href;
-  if (!isAllowed(abs)) return socket.destroy();
-  req.__target = abs;
+  if (!shouldProxy(target.href)) return socket.destroy();
+  req.__target = target.href;
   proxyFor(target.origin).upgrade(req, socket, head);
 });
 
-server.listen(PORT, '0.0.0.0', () => {
-  console.log('listening on ' + PORT);
-});
+server.listen(PORT, '0.0.0.0', () => console.log('listening on ' + PORT));
