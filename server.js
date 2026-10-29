@@ -424,6 +424,9 @@ function proxyFor(origin) {
     proxyTimeout: 180000,
     timeout: 180000,
 
+    // req.url は Express に復元されることがあるため、送るパスは自前の値で確定させる
+    pathRewrite: (p, req) => req.__path || p,
+
     onProxyReq(proxyReq, req) {
       for (const k of [
         'x-forwarded-for',
@@ -445,8 +448,7 @@ function proxyFor(origin) {
       proxyReq.removeHeader('if-none-match');
       proxyReq.removeHeader('if-modified-since');
 
-      // 実際に送った内容を記録する
-      pushLog({ t: Date.now(), sent: `${req.method} https://${targetHost}${req.url}` });
+      pushLog({ t: Date.now(), sent: `${req.method} https://${targetHost}${req.__path}` });
     },
 
     onProxyRes(proxyRes, req, res) {
@@ -554,7 +556,7 @@ function probeOnce(url, method, body, headers) {
             if (/^(server|via|x-cache|x-amz|akamai|cf-|x-akamai|x-served|x-nv|content-type)/i.test(k))
               keep[k] = resp.headers[k];
           }
-          resolve({ status: resp.statusCode, headers: keep, body: b.toString('utf8').slice(0, 700) });
+          resolve({ status: resp.statusCode, headers: keep, body: b.toString('utf8').slice(0, 500) });
         });
       }
     );
@@ -601,7 +603,7 @@ function probeH2(url, method, body, headers) {
       });
       r.on('data', (d) => chunks.push(d));
       r.on('end', () =>
-        done({ status, headers: hdrs, body: Buffer.concat(chunks).toString('utf8').slice(0, 600) })
+        done({ status, headers: hdrs, body: Buffer.concat(chunks).toString('utf8').slice(0, 400) })
       );
       r.on('error', (e) => done({ error: e.message }));
       if (body) r.write(body);
@@ -621,7 +623,7 @@ function probeLocal(path, headers) {
           resolve({
             status: resp.statusCode,
             contentType: resp.headers['content-type'],
-            body: Buffer.concat(chunks).toString('utf8').slice(0, 400),
+            body: Buffer.concat(chunks).toString('utf8').slice(0, 300),
           })
         );
       }
@@ -640,18 +642,9 @@ app.disable('x-powered-by');
 app.disable('etag');
 app.set('trust proxy', true);
 
-app.use((req, res, next) => {
-  if (!req.path.startsWith('/__')) return next();
-  if (!process.env.BASIC_USER || !process.env.BASIC_PASS) return next();
-  const auth = req.headers.authorization || '';
-  const [u, p] = Buffer.from(auth.replace(/^Basic\s+/i, ''), 'base64').toString().split(':');
-  if (u === process.env.BASIC_USER && p === process.env.BASIC_PASS) return next();
-  res.writeHead(401, { 'www-authenticate': 'Basic realm="gfn"' });
-  res.end('Auth required');
-});
-
 if (process.env.BASIC_USER && process.env.BASIC_PASS) {
   app.use((req, res, next) => {
+    if (req.path.startsWith('/__')) return next();
     const auth = req.headers.authorization || '';
     const [u, p] = Buffer.from(auth.replace(/^Basic\s+/i, ''), 'base64').toString().split(':');
     if (u === process.env.BASIC_USER && p === process.env.BASIC_PASS) return next();
@@ -693,7 +686,6 @@ app.get('/__selftest', async (req, res) => {
   );
 });
 
-// サーバー内から自前のプロキシ経路を叩く（ミドルウェアが素通りしていないかの検査）
 app.get('/__proxytest', async (req, res) => {
   const u = String(req.query.u || 'https://pcs.geforcenow.com/v1/serviceUrls');
   const r = await probeLocal('/__p/' + u, { accept: '*/*', 'user-agent': UA });
@@ -740,7 +732,8 @@ app.use(PREFIX, (req, res, next) => {
   if (!target) return res.status(400).type('text/plain').send('Bad URL');
   if (!shouldProxy(target.href)) return res.status(403).type('text/plain').send('Not proxied: ' + target.host);
   req.__target = target.href;
-  req.url = target.pathname + target.search;
+  req.__path = target.pathname + target.search;
+  req.url = req.__path;
 
   return proxyFor(target.origin)(req, res, () => {
     pushLog({ t: Date.now(), fellThrough: req.__target });
@@ -750,6 +743,7 @@ app.use(PREFIX, (req, res, next) => {
 
 app.use((req, res, next) => {
   req.__target = ORIGIN + req.originalUrl;
+  req.__path = req.originalUrl;
   return proxyFor(ORIGIN)(req, res, () => res.status(502).type('text/plain').send('no handler'));
 });
 
@@ -761,9 +755,11 @@ server.on('upgrade', (req, socket, head) => {
   if (req.url.startsWith(PREFIX)) {
     target = normalizeTarget(req.url.slice(PREFIX.length), selfHost);
     if (!target) return socket.destroy();
-    req.url = target.pathname + target.search;
+    req.__path = target.pathname + target.search;
+    req.url = req.__path;
   } else {
     target = new URL(req.url, ORIGIN);
+    req.__path = target.pathname + target.search;
   }
   if (!shouldProxy(target.href)) return socket.destroy();
   req.__target = target.href;
