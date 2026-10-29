@@ -1,0 +1,16 @@
+services:
+  - type: web
+    name: gfn-proxy
+    runtime: node
+    plan: free
+    region: singapore
+    buildCommand: npm install
+    startCommand: node server.js
+    healthCheckPath: /__health
+    envVars:
+      - key: DEFAULT_TARGET
+        value: https://play.geforcenow.com/
+      - key: FALLBACK_HOST
+        value: play.geforcenow.com
+      - key: NODE_VERSION
+        value: "20"
