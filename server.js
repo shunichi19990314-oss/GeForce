@@ -2,6 +2,7 @@
 
 const http = require('http');
 const https = require('https');
+const http2 = require('http2');
 const zlib = require('zlib');
 const express = require('express');
 const cheerio = require('cheerio');
@@ -137,24 +138,87 @@ const SHIM = `(function () {
     return P + a;
   }
 
-  var box = null, count = 0;
+  // ---------------- log overlay ----------------
+  var box = null, list = null, lines = [], count = 0;
+
+  function mkBtn(label, fn) {
+    var b = document.createElement('button');
+    b.textContent = label;
+    b.style.cssText = 'font:inherit;color:#0f0;background:#022;border:1px solid #0f0;border-radius:4px;padding:1px 7px;cursor:pointer';
+    b.addEventListener('click', function (e) { e.stopPropagation(); fn(b); });
+    return b;
+  }
+
+  function copyText(text) {
+    try {
+      var ta = document.createElement('textarea');
+      ta.value = text;
+      ta.style.cssText = 'position:fixed;top:0;left:0;opacity:0';
+      document.body.appendChild(ta);
+      ta.select();
+      var ok = document.execCommand('copy');
+      ta.remove();
+      return ok;
+    } catch (e) { return false; }
+  }
+
+  function copyAll(b) {
+    var text = lines.join('\\n');
+    var flash = function (ok) {
+      b.textContent = ok ? 'COPIED' : 'FAILED';
+      setTimeout(function () { b.textContent = 'COPY'; }, 1200);
+    };
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(text).then(
+        function () { flash(true); },
+        function () { flash(copyText(text)); }
+      );
+    } else {
+      flash(copyText(text));
+    }
+  }
+
   function overlay() {
     if (box) return box;
     box = document.createElement('div');
-    box.style.cssText = 'position:fixed;z-index:2147483647;right:8px;bottom:8px;width:min(560px,90vw);max-height:45vh;overflow:auto;background:#000d;color:#0f0;font:11px/1.4 monospace;padding:8px;border:1px solid #0f0;border-radius:6px;white-space:pre-wrap';
-    box.addEventListener('click', function () { box.remove(); box = null; });
+    box.style.cssText = 'position:fixed;z-index:2147483647;right:8px;bottom:8px;width:min(620px,92vw);max-height:48vh;display:flex;flex-direction:column;background:#000e;color:#0f0;font:11px/1.45 monospace;border:1px solid #0f0;border-radius:6px;overflow:hidden';
+
+    var head = document.createElement('div');
+    head.style.cssText = 'display:flex;gap:6px;align-items:center;padding:5px 7px;border-bottom:1px solid #0f066;background:#011';
+
+    var title = document.createElement('span');
+    title.textContent = 'GFN PROXY LOG';
+    title.style.cssText = 'flex:1;font-weight:bold;letter-spacing:.5px';
+
+    head.appendChild(title);
+    head.appendChild(mkBtn('COPY', copyAll));
+    head.appendChild(mkBtn('CLEAR', function () { lines = []; if (list) list.textContent = ''; }));
+    head.appendChild(mkBtn('CLOSE', function () { box.remove(); box = null; list = null; }));
+
+    list = document.createElement('div');
+    list.style.cssText = 'flex:1;overflow:auto;padding:6px 7px;white-space:pre-wrap;overflow-wrap:anywhere;user-select:text;-webkit-user-select:text';
+
+    box.appendChild(head);
+    box.appendChild(list);
     document.documentElement.appendChild(box);
     return box;
   }
+
   function log(kind, url, extra) {
-    if (count++ > 200) return;
     var line = '[' + kind + '] ' + (extra || '') + ' ' + String(url);
-    (overlay().appendChild(document.createElement('div'))).textContent = line;
     console.warn('GFN-PROXY', line);
+    if (count++ > 300) return;
+    lines.push(line);
+    if (!box) return;
+    var d = document.createElement('div');
+    d.textContent = line;
+    list.appendChild(d);
+    list.scrollTop = list.scrollHeight;
   }
 
   function ref() { try { return base(); } catch (e) { return ''; } }
 
+  // ---------------- network hooks ----------------
   var of = window.fetch;
   window.fetch = function (input, init) {
     var target = typeof input === 'string' || input instanceof URL ? String(input) : (input && input.url);
@@ -172,6 +236,7 @@ const SHIM = `(function () {
     var args = [].slice.call(arguments);
     var mapped = map(u);
     args[1] = mapped;
+    this.__mapped = mapped;
     this.addEventListener('loadend', function () {
       if (this.status === 0 || this.status >= 400) log('xhr', mapped, this.status || 'ERR');
     });
@@ -195,6 +260,7 @@ const SHIM = `(function () {
     var mapped = map(url);
     var ws = protocols === undefined ? new OWS(mapped) : new OWS(mapped, protocols);
     ws.addEventListener('error', function () { log('ws', mapped, 'ERR'); });
+    ws.addEventListener('open', function () { log('ws', mapped, 'OPEN'); });
     return ws;
   }
   WSP.prototype = OWS.prototype;
@@ -230,10 +296,12 @@ const SHIM = `(function () {
 
   if (/[?&]debug=1/.test(location.href) || localStorage.getItem('gfnDebug') === '1') {
     localStorage.setItem('gfnDebug', '1');
-    if (document.readyState === 'loading')
-      document.addEventListener('DOMContentLoaded', overlay);
-    else overlay();
-    log('init', window.__GFN_DOC__ || location.href, 'debug on');
+    var boot = function () {
+      overlay();
+      log('init', window.__GFN_DOC__ || location.href, 'debug on');
+    };
+    if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', boot);
+    else boot();
   }
 })();`;
 
@@ -275,7 +343,6 @@ function normalizeTarget(raw, selfHost) {
   return null;
 }
 
-// プロキシ上の referer を本来の URL に戻す
 function toRealReferer(v) {
   if (!v) return ORIGIN + '/';
   try {
@@ -315,6 +382,19 @@ function proxyFor(origin) {
     timeout: 180000,
 
     onProxyReq(proxyReq, req) {
+      // Render 由来の転送ヘッダを持ち越さない（NVIDIA 側が別ホスト扱いして 404 を返す）
+      for (const k of [
+        'x-forwarded-for',
+        'x-forwarded-host',
+        'x-forwarded-proto',
+        'x-forwarded-port',
+        'forwarded',
+        'true-client-ip',
+        'cf-connecting-ip',
+        'x-real-ip',
+      ]) {
+        proxyReq.removeHeader(k);
+      }
       proxyReq.setHeader('accept-encoding', 'gzip, deflate, br');
       proxyReq.setHeader('origin', ORIGIN);
       proxyReq.setHeader('referer', toRealReferer(req.headers['x-gfn-ref'] || req.headers.referer));
@@ -425,7 +505,7 @@ function probeOnce(url, method, body, headers) {
           } catch {}
           const keep = {};
           for (const k of Object.keys(resp.headers)) {
-            if (/^(server|via|x-cache|x-amz|akamai|cf-|x-akamai|x-azure|x-served|content-type|x-gfn|x-nv)/i.test(k))
+            if (/^(server|via|x-cache|x-amz|akamai|cf-|x-akamai|x-served|x-nv|content-type)/i.test(k))
               keep[k] = resp.headers[k];
           }
           resolve({ status: resp.statusCode, headers: keep, body: b.toString('utf8').slice(0, 1200) });
@@ -439,6 +519,48 @@ function probeOnce(url, method, body, headers) {
     });
     if (body) r.write(body);
     r.end();
+  });
+}
+
+function probeH2(url, method, body, headers) {
+  return new Promise((resolve) => {
+    let u;
+    try {
+      u = new URL(url);
+    } catch {
+      return resolve({ error: 'bad url' });
+    }
+    const c = http2.connect(u.origin);
+    const done = (v) => {
+      try {
+        c.close();
+      } catch {}
+      resolve(v);
+    };
+    c.on('error', (e) => done({ error: e.message }));
+    c.on('connect', () => {
+      const r = c.request({
+        ':method': method,
+        ':path': u.pathname + u.search,
+        ':authority': u.host,
+        ':scheme': 'https',
+        ...headers,
+      });
+      let status = null;
+      let hdrs = {};
+      const chunks = [];
+      r.on('response', (h) => {
+        status = h[':status'];
+        hdrs = h;
+      });
+      r.on('data', (d) => chunks.push(d));
+      r.on('end', () =>
+        done({ status, headers: hdrs, body: Buffer.concat(chunks).toString('utf8').slice(0, 800) })
+      );
+      r.on('error', (e) => done({ error: e.message }));
+      if (body) r.write(body);
+      r.end();
+    });
   });
 }
 
@@ -470,7 +592,6 @@ app.get('/__shim.js', (req, res) => {
   res.send(SHIM);
 });
 
-// 調査用: /__probe?u=https://pcs.geforcenow.com/v1/serviceUrls
 app.get('/__probe', async (req, res) => {
   const selfHost = String(req.headers.host || '').toLowerCase();
   const t = normalizeTarget(String(req.query.u || ''), selfHost);
@@ -479,28 +600,25 @@ app.get('/__probe', async (req, res) => {
   const body = req.query.b ? String(req.query.b) : null;
 
   const base = { 'user-agent': UA, accept: '*/*', 'accept-language': 'en-US,en;q=0.9' };
-
-  const out = {};
-  out.A_minimal = await probeOnce(t.href, method, body, { ...base });
-  out.B_with_origin = await probeOnce(t.href, method, body, {
+  const browserish = {
     ...base,
     origin: ORIGIN,
     referer: ORIGIN + '/',
     'sec-fetch-site': 'same-origin',
     'sec-fetch-mode': 'cors',
     'sec-fetch-dest': 'empty',
-  });
-  out.C_forwarded = await probeOnce(t.href, method, body, {
-    ...base,
-    origin: ORIGIN,
-    referer: ORIGIN + t.pathname,
-    'x-forwarded-for': '203.0.113.9',
-    'x-forwarded-host': 'play.geforcenow.com',
+  };
+
+  const out = {};
+  out.A_bare = await probeOnce(t.href, method, body, { ...base });
+  out.B_browserish = await probeOnce(t.href, method, body, { ...browserish });
+  out.C_with_forwarded = await probeOnce(t.href, method, body, {
+    ...browserish,
+    'x-forwarded-for': req.headers['x-forwarded-for'] || '203.0.113.9',
+    'x-forwarded-host': selfHost,
     'x-forwarded-proto': 'https',
-    'sec-ch-ua': '"Chromium";v="141", "Not?A_Brand";v="24"',
-    'sec-ch-ua-mobile': '?0',
-    'sec-ch-ua-platform': '"Windows"',
   });
+  out.D_http2 = await probeH2(t.href, method, body, { ...browserish });
 
   res.type('application/json');
   res.send(JSON.stringify({ target: t.href, method, out }, null, 2));
