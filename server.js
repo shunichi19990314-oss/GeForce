@@ -141,6 +141,9 @@ const SHIM = `(function () {
   // ---------------- log overlay ----------------
   var box = null, list = null, lines = [], count = 0;
 
+  function store(k, v) { try { localStorage.setItem(k, v); } catch (e) {} }
+  function load(k) { try { return localStorage.getItem(k); } catch (e) { return null; } }
+
   function mkBtn(label, fn) {
     var b = document.createElement('button');
     b.textContent = label;
@@ -193,14 +196,27 @@ const SHIM = `(function () {
     head.appendChild(title);
     head.appendChild(mkBtn('COPY', copyAll));
     head.appendChild(mkBtn('CLEAR', function () { lines = []; if (list) list.textContent = ''; }));
-    head.appendChild(mkBtn('CLOSE', function () { box.remove(); box = null; list = null; }));
+    head.appendChild(mkBtn('CLOSE', function () {
+      store('gfnDebug', '0');
+      box.remove();
+      box = null;
+      list = null;
+    }));
 
     list = document.createElement('div');
     list.style.cssText = 'flex:1;overflow:auto;padding:6px 7px;white-space:pre-wrap;overflow-wrap:anywhere;user-select:text;-webkit-user-select:text';
+    list.textContent = '(まだ通信ログはありません)';
 
     box.appendChild(head);
     box.appendChild(list);
     document.documentElement.appendChild(box);
+
+    for (var i = 0; i < lines.length; i++) {
+      var d = document.createElement('div');
+      d.textContent = lines[i];
+      list.appendChild(d);
+    }
+    list.scrollTop = list.scrollHeight;
     return box;
   }
 
@@ -208,6 +224,7 @@ const SHIM = `(function () {
     var line = '[' + kind + '] ' + (extra || '') + ' ' + String(url);
     console.warn('GFN-PROXY', line);
     if (count++ > 300) return;
+    if (lines.length === 0 && list) list.textContent = '';
     lines.push(line);
     if (!box) return;
     var d = document.createElement('div');
@@ -236,7 +253,6 @@ const SHIM = `(function () {
     var args = [].slice.call(arguments);
     var mapped = map(u);
     args[1] = mapped;
-    this.__mapped = mapped;
     this.addEventListener('loadend', function () {
       if (this.status === 0 || this.status >= 400) log('xhr', mapped, this.status || 'ERR');
     });
@@ -294,15 +310,18 @@ const SHIM = `(function () {
     navigator.sendBeacon = function (u, d) { return ob(map(u), d); };
   }
 
-  if (/[?&]debug=1/.test(location.href) || localStorage.getItem('gfnDebug') === '1') {
-    localStorage.setItem('gfnDebug', '1');
-    var boot = function () {
-      overlay();
-      log('init', window.__GFN_DOC__ || location.href, 'debug on');
-    };
-    if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', boot);
-    else boot();
+  // 既定で表示。?debug=0 か CLOSE で非表示（記憶される）
+  var want = load('gfnDebug');
+  if (/[?&]debug=0/.test(location.href)) { want = '0'; store('gfnDebug', '0'); }
+  else if (/[?&]debug=1/.test(location.href)) { want = '1'; store('gfnDebug', '1'); }
+  if (want === null) want = '1';
+
+  function boot() {
+    if (want !== '0') overlay();
+    log('init', window.__GFN_DOC__ || location.href, 'shim active');
   }
+  if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', boot);
+  else boot();
 })();`;
 
 const LOG = [];
@@ -382,7 +401,6 @@ function proxyFor(origin) {
     timeout: 180000,
 
     onProxyReq(proxyReq, req) {
-      // Render 由来の転送ヘッダを持ち越さない（NVIDIA 側が別ホスト扱いして 404 を返す）
       for (const k of [
         'x-forwarded-for',
         'x-forwarded-host',
@@ -590,6 +608,28 @@ app.get('/__shim.js', (req, res) => {
   res.type('application/javascript; charset=utf-8');
   res.setHeader('cache-control', 'no-cache');
   res.send(SHIM);
+});
+
+// シムが実際にHTMLへ注入されているかの自己診断
+app.get('/__selftest', async (req, res) => {
+  const r = await probeOnce(ORIGIN + '/mall/', 'GET', null, {
+    'user-agent': UA,
+    accept: 'text/html',
+  });
+  const body = r.body || '';
+  res.type('application/json');
+  res.send(
+    JSON.stringify(
+      {
+        originStatus: r.status,
+        shimTagPresent: body.includes('/__shim.js'),
+        docVarPresent: body.includes('__GFN_DOC__'),
+        snippet: body.slice(0, 400),
+      },
+      null,
+      2
+    )
+  );
 });
 
 app.get('/__probe', async (req, res) => {
