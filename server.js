@@ -181,6 +181,26 @@ const SHIM = `(function () {
     }
   }
 
+  var PROBE_URLS = [
+    'https://pcs.geforcenow.com/v1/serviceUrls',
+    'https://apps.gxn.nvidia.com/graphql',
+    'https://gx-target-experiments-frontend-api.gx.nvidia.com/cloudvariables/v3'
+  ];
+
+  function runProbe(b) {
+    b.textContent = 'RUNNING';
+    var i = 0;
+    (function step() {
+      if (i >= PROBE_URLS.length) { b.textContent = 'PROBE'; return; }
+      var u = PROBE_URLS[i++];
+      fetch('/__probe?u=' + encodeURIComponent(u))
+        .then(function (r) { return r.text(); })
+        .then(function (t) { log('probe', u, '\\n  ' + t.replace(/\\n/g, '\\n  ')); })
+        .catch(function (e) { log('probe', u, 'ERR ' + e.message); })
+        .then(step);
+    })();
+  }
+
   function overlay() {
     if (box) return box;
     box = document.createElement('div');
@@ -194,6 +214,7 @@ const SHIM = `(function () {
     title.style.cssText = 'flex:1;font-weight:bold;letter-spacing:.5px';
 
     head.appendChild(title);
+    head.appendChild(mkBtn('PROBE', runProbe));
     head.appendChild(mkBtn('COPY', copyAll));
     head.appendChild(mkBtn('CLEAR', function () { lines = []; if (list) list.textContent = ''; }));
     head.appendChild(mkBtn('CLOSE', function () {
@@ -223,7 +244,7 @@ const SHIM = `(function () {
   function log(kind, url, extra) {
     var line = '[' + kind + '] ' + (extra || '') + ' ' + String(url);
     console.warn('GFN-PROXY', line);
-    if (count++ > 300) return;
+    if (count++ > 400) return;
     if (lines.length === 0 && list) list.textContent = '';
     lines.push(line);
     if (!box) return;
@@ -310,7 +331,6 @@ const SHIM = `(function () {
     navigator.sendBeacon = function (u, d) { return ob(map(u), d); };
   }
 
-  // 既定で表示。?debug=0 か CLOSE で非表示（記憶される）
   var want = load('gfnDebug');
   if (/[?&]debug=0/.test(location.href)) { want = '0'; store('gfnDebug', '0'); }
   else if (/[?&]debug=1/.test(location.href)) { want = '1'; store('gfnDebug', '1'); }
@@ -389,6 +409,8 @@ const proxyCache = new Map();
 function proxyFor(origin) {
   if (proxyCache.has(origin)) return proxyCache.get(origin);
 
+  const targetHost = new URL(origin).host;
+
   const mw = createProxyMiddleware({
     target: origin,
     changeOrigin: true,
@@ -413,6 +435,8 @@ function proxyFor(origin) {
       ]) {
         proxyReq.removeHeader(k);
       }
+      // 宛先ホストを明示的に固定する（ここが崩れると Akamai=404 / CloudFront=403 になる）
+      proxyReq.setHeader('host', targetHost);
       proxyReq.setHeader('accept-encoding', 'gzip, deflate, br');
       proxyReq.setHeader('origin', ORIGIN);
       proxyReq.setHeader('referer', toRealReferer(req.headers['x-gfn-ref'] || req.headers.referer));
@@ -526,7 +550,7 @@ function probeOnce(url, method, body, headers) {
             if (/^(server|via|x-cache|x-amz|akamai|cf-|x-akamai|x-served|x-nv|content-type)/i.test(k))
               keep[k] = resp.headers[k];
           }
-          resolve({ status: resp.statusCode, headers: keep, body: b.toString('utf8').slice(0, 1200) });
+          resolve({ status: resp.statusCode, headers: keep, body: b.toString('utf8').slice(0, 900) });
         });
       }
     );
@@ -573,7 +597,7 @@ function probeH2(url, method, body, headers) {
       });
       r.on('data', (d) => chunks.push(d));
       r.on('end', () =>
-        done({ status, headers: hdrs, body: Buffer.concat(chunks).toString('utf8').slice(0, 800) })
+        done({ status, headers: hdrs, body: Buffer.concat(chunks).toString('utf8').slice(0, 700) })
       );
       r.on('error', (e) => done({ error: e.message }));
       if (body) r.write(body);
@@ -610,7 +634,6 @@ app.get('/__shim.js', (req, res) => {
   res.send(SHIM);
 });
 
-// シムが実際にHTMLへ注入されているかの自己診断
 app.get('/__selftest', async (req, res) => {
   const r = await probeOnce(ORIGIN + '/mall/', 'GET', null, {
     'user-agent': UA,
@@ -624,7 +647,6 @@ app.get('/__selftest', async (req, res) => {
         originStatus: r.status,
         shimTagPresent: body.includes('/__shim.js'),
         docVarPresent: body.includes('__GFN_DOC__'),
-        snippet: body.slice(0, 400),
       },
       null,
       2
@@ -642,6 +664,7 @@ app.get('/__probe', async (req, res) => {
   const base = { 'user-agent': UA, accept: '*/*', 'accept-language': 'en-US,en;q=0.9' };
   const browserish = {
     ...base,
+    host: t.host,
     origin: ORIGIN,
     referer: ORIGIN + '/',
     'sec-fetch-site': 'same-origin',
@@ -650,7 +673,7 @@ app.get('/__probe', async (req, res) => {
   };
 
   const out = {};
-  out.A_bare = await probeOnce(t.href, method, body, { ...base });
+  out.A_bare = await probeOnce(t.href, method, body, { ...base, host: t.host });
   out.B_browserish = await probeOnce(t.href, method, body, { ...browserish });
   out.C_with_forwarded = await probeOnce(t.href, method, body, {
     ...browserish,
