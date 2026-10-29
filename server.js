@@ -1,6 +1,8 @@
 'use strict';
 
 const http = require('http');
+const https = require('https');
+const zlib = require('zlib');
 const express = require('express');
 const cheerio = require('cheerio');
 const { createProxyMiddleware } = require('http-proxy-middleware');
@@ -92,7 +94,6 @@ function rewriteHtml(html, base) {
   $('script[integrity], link[integrity]').removeAttr('integrity');
   $('*[crossorigin]').removeAttr('crossorigin');
 
-  // 本来のドキュメントURLをシムへ渡す（相対URL解決の基準）
   $('head').prepend(
     `<script>window.__GFN_DOC__=${JSON.stringify(base)};</script>` +
       '<script src="/__shim.js"></script>'
@@ -114,8 +115,6 @@ const SHIM = `(function () {
   var OH = ${JSON.stringify(ORIGIN_HOST)};
   var BLOCK = new RegExp(${JSON.stringify(BLOCK_RE.source)}, 'i');
 
-  // 相対URLの解決基準は「本来のドキュメントURL」。
-  // 無ければ現在地から復元する（プロキシ自身のオリジンには解決させない）。
   function base() {
     if (window.__GFN_DOC__) return window.__GFN_DOC__;
     var p = location.pathname + location.search + location.hash;
@@ -154,6 +153,8 @@ const SHIM = `(function () {
     console.warn('GFN-PROXY', line);
   }
 
+  function ref() { try { return base(); } catch (e) { return ''; } }
+
   var of = window.fetch;
   window.fetch = function (input, init) {
     var target = typeof input === 'string' || input instanceof URL ? String(input) : (input && input.url);
@@ -175,6 +176,18 @@ const SHIM = `(function () {
       if (this.status === 0 || this.status >= 400) log('xhr', mapped, this.status || 'ERR');
     });
     return xo.apply(this, args);
+  };
+
+  var xs = XMLHttpRequest.prototype.send;
+  XMLHttpRequest.prototype.send = function () {
+    try { if (!this.__refset) { this.__refset = 1; this.setRequestHeader('x-gfn-ref', ref()); } } catch (e) {}
+    return xs.apply(this, arguments);
+  };
+
+  var os = XMLHttpRequest.prototype.setRequestHeader;
+  XMLHttpRequest.prototype.setRequestHeader = function (k, v) {
+    if (String(k).toLowerCase() === 'x-gfn-ref') this.__refset = 1;
+    return os.call(this, k, v);
   };
 
   var OWS = window.WebSocket;
@@ -230,12 +243,6 @@ function pushLog(o) {
   if (LOG.length > 300) LOG.shift();
 }
 
-/**
- * 受け取った生パスを正規化する。
- * - プロキシ自身のホストを指していたらパスに畳む
- * - 先頭の /__p/ が二重三重に付いていたら剥がす
- * - スキーム無しは ORIGIN 配下のパスとして扱う
- */
 function normalizeTarget(raw, selfHost) {
   let cur = String(raw || '').trim();
   for (let i = 0; i < 4; i++) {
@@ -268,6 +275,29 @@ function normalizeTarget(raw, selfHost) {
   return null;
 }
 
+// プロキシ上の referer を本来の URL に戻す
+function toRealReferer(v) {
+  if (!v) return ORIGIN + '/';
+  try {
+    const u = new URL(v);
+    if (u.pathname.startsWith(PREFIX)) {
+      const t = normalizeTarget(u.pathname.slice(PREFIX.length) + u.search, u.host);
+      if (t) return t.href;
+    }
+    return ORIGIN + u.pathname + u.search;
+  } catch {
+    return ORIGIN + '/';
+  }
+}
+
+function decodeBody(buf, enc) {
+  const e = String(enc || '').toLowerCase();
+  if (e === 'gzip') return zlib.gunzipSync(buf);
+  if (e === 'br') return zlib.brotliDecompressSync(buf);
+  if (e === 'deflate') return zlib.inflateSync(buf);
+  return buf;
+}
+
 const proxyCache = new Map();
 
 function proxyFor(origin) {
@@ -278,7 +308,6 @@ function proxyFor(origin) {
     changeOrigin: true,
     ws: true,
     secure: true,
-    xfwd: true,
     selfHandleResponse: true,
     cookieDomainRewrite: '',
     cookiePathRewrite: '/',
@@ -286,9 +315,10 @@ function proxyFor(origin) {
     timeout: 180000,
 
     onProxyReq(proxyReq, req) {
-      proxyReq.setHeader('accept-encoding', 'identity');
+      proxyReq.setHeader('accept-encoding', 'gzip, deflate, br');
       proxyReq.setHeader('origin', ORIGIN);
-      proxyReq.setHeader('referer', ORIGIN + '/');
+      proxyReq.setHeader('referer', toRealReferer(req.headers['x-gfn-ref'] || req.headers.referer));
+      proxyReq.removeHeader('x-gfn-ref');
       proxyReq.removeHeader('if-none-match');
       proxyReq.removeHeader('if-modified-since');
     },
@@ -325,11 +355,21 @@ function proxyFor(origin) {
       const chunks = [];
       proxyRes.on('data', (c) => chunks.push(c));
       proxyRes.on('end', () => {
-        let body = Buffer.concat(chunks).toString('utf8');
+        const raw = Buffer.concat(chunks);
+        let text;
+        try {
+          text = decodeBody(raw, h['content-encoding']).toString('utf8');
+        } catch {
+          delete h['transfer-encoding'];
+          res.writeHead(status, h);
+          return res.end(raw);
+        }
+
+        let body = text;
         try {
           body = isHtml
-            ? rewriteHtml(body, req.__target || ORIGIN)
-            : rewriteCss(body, req.__target || ORIGIN);
+            ? rewriteHtml(text, req.__target || ORIGIN)
+            : rewriteCss(text, req.__target || ORIGIN);
         } catch {}
 
         const buf = Buffer.from(body, 'utf8');
@@ -354,6 +394,52 @@ function proxyFor(origin) {
 
   proxyCache.set(origin, mw);
   return mw;
+}
+
+const UA =
+  'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/141.0.0.0 Safari/537.36';
+
+function probeOnce(url, method, body, headers) {
+  return new Promise((resolve) => {
+    let u;
+    try {
+      u = new URL(url);
+    } catch {
+      return resolve({ error: 'bad url' });
+    }
+    const r = https.request(
+      {
+        hostname: u.hostname,
+        path: u.pathname + u.search,
+        method,
+        timeout: 20000,
+        headers,
+      },
+      (resp) => {
+        const chunks = [];
+        resp.on('data', (c) => chunks.push(c));
+        resp.on('end', () => {
+          let b = Buffer.concat(chunks);
+          try {
+            b = decodeBody(b, resp.headers['content-encoding']);
+          } catch {}
+          const keep = {};
+          for (const k of Object.keys(resp.headers)) {
+            if (/^(server|via|x-cache|x-amz|akamai|cf-|x-akamai|x-azure|x-served|content-type|x-gfn|x-nv)/i.test(k))
+              keep[k] = resp.headers[k];
+          }
+          resolve({ status: resp.statusCode, headers: keep, body: b.toString('utf8').slice(0, 1200) });
+        });
+      }
+    );
+    r.on('error', (e) => resolve({ error: e.message }));
+    r.on('timeout', () => {
+      r.destroy();
+      resolve({ error: 'timeout' });
+    });
+    if (body) r.write(body);
+    r.end();
+  });
 }
 
 const app = express();
@@ -384,15 +470,47 @@ app.get('/__shim.js', (req, res) => {
   res.send(SHIM);
 });
 
+// 調査用: /__probe?u=https://pcs.geforcenow.com/v1/serviceUrls
+app.get('/__probe', async (req, res) => {
+  const selfHost = String(req.headers.host || '').toLowerCase();
+  const t = normalizeTarget(String(req.query.u || ''), selfHost);
+  if (!t) return res.status(400).type('text/plain').send('bad u');
+  const method = String(req.query.m || 'GET').toUpperCase();
+  const body = req.query.b ? String(req.query.b) : null;
+
+  const base = { 'user-agent': UA, accept: '*/*', 'accept-language': 'en-US,en;q=0.9' };
+
+  const out = {};
+  out.A_minimal = await probeOnce(t.href, method, body, { ...base });
+  out.B_with_origin = await probeOnce(t.href, method, body, {
+    ...base,
+    origin: ORIGIN,
+    referer: ORIGIN + '/',
+    'sec-fetch-site': 'same-origin',
+    'sec-fetch-mode': 'cors',
+    'sec-fetch-dest': 'empty',
+  });
+  out.C_forwarded = await probeOnce(t.href, method, body, {
+    ...base,
+    origin: ORIGIN,
+    referer: ORIGIN + t.pathname,
+    'x-forwarded-for': '203.0.113.9',
+    'x-forwarded-host': 'play.geforcenow.com',
+    'x-forwarded-proto': 'https',
+    'sec-ch-ua': '"Chromium";v="141", "Not?A_Brand";v="24"',
+    'sec-ch-ua-mobile': '?0',
+    'sec-ch-ua-platform': '"Windows"',
+  });
+
+  res.type('application/json');
+  res.send(JSON.stringify({ target: t.href, method, out }, null, 2));
+});
+
 app.use(PREFIX, (req, res, next) => {
   const selfHost = String(req.headers.host || '').toLowerCase();
   const target = normalizeTarget(req.originalUrl.slice(PREFIX.length), selfHost);
-  if (!target) {
-    return res.status(400).type('text/plain').send('Bad URL');
-  }
-  if (!shouldProxy(target.href)) {
-    return res.status(403).type('text/plain').send('Not proxied: ' + target.host);
-  }
+  if (!target) return res.status(400).type('text/plain').send('Bad URL');
+  if (!shouldProxy(target.href)) return res.status(403).type('text/plain').send('Not proxied: ' + target.host);
   req.__target = target.href;
   req.url = target.pathname + target.search;
   return proxyFor(target.origin)(req, res, next);
