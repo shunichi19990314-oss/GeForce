@@ -96,19 +96,11 @@ function rewriteRedirectInForm(s, selfHost) {
 function rewriteHtml(html, base) {
   const $ = cheerio.load(html);
 
-  // 別ホストのページは <base href="/"> がルート解決になり、相対 import が壊れる。
-  // base は「プロキシ上のパス」でなければならない。
-  let baseHost = ORIGIN_HOST;
-  try {
-    baseHost = new URL(base).host;
-  } catch {}
-  if (baseHost !== ORIGIN_HOST) {
-    const clean = base.replace(/[?#].*$/, '');
-    const idx = clean.lastIndexOf('/');
-    const dir = PREFIX + (idx >= 0 ? clean.slice(0, idx + 1) : clean + '/');
-    $('base').remove();
-    $('head').prepend(`<base href="${dir}">`);
-  }
+  // 元の <base href> をプロキシ形式へ変換する（"/" は元ホストのルートを意味する）
+  $('base[href]').each((_, el) => {
+    const v = $(el).attr('href');
+    if (v) $(el).attr('href', mapUrl(v, base));
+  });
 
   const pairs = [
     ['script', 'src'],
@@ -317,7 +309,6 @@ const SHIM = `(function () {
 
   function ref() { try { return base(); } catch (e) { return ''; } }
 
-  // リソース読み込み失敗とJS例外を拾う
   window.addEventListener('error', function (e) {
     var t = e && e.target;
     if (t && t !== window && (t.src || t.href)) log('res', t.src || t.href, 'FAIL');
