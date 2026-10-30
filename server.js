@@ -172,7 +172,6 @@ const SHIM = `(function () {
     if (u == null) return u;
     var s = String(u);
     if (/^(data:|blob:|javascript:|about:|#)/i.test(s)) return u;
-    // 内部エンドポイントは素通し
     if (s.indexOf('/__') === 0) return s;
     var a;
     try { a = new URL(s, base()).href; } catch (e) { return u; }
@@ -227,6 +226,15 @@ const SHIM = `(function () {
     }
   }
 
+  function runLogin(b) {
+    b.textContent = 'RUNNING';
+    fetch('/__loginflow')
+      .then(function (r) { return r.text(); })
+      .then(function (t) { log('loginflow', '', '\\n  ' + t.replace(/\\n/g, '\\n  ')); })
+      .catch(function (e) { log('loginflow', '', 'ERR ' + e.message); })
+      .then(function () { b.textContent = 'LOGIN'; });
+  }
+
   function runRedir(b) {
     b.textContent = 'RUNNING';
     fetch('/__redirtest')
@@ -234,24 +242,6 @@ const SHIM = `(function () {
       .then(function (t) { log('redirtest', '', '\\n  ' + t.replace(/\\n/g, '\\n  ')); })
       .catch(function (e) { log('redirtest', '', 'ERR ' + e.message); })
       .then(function () { b.textContent = 'REDIR'; });
-  }
-
-  function runProbe(b) {
-    b.textContent = 'RUNNING';
-    var urls = [
-      'https://pcs.geforcenow.com/v1/serviceUrls',
-      'https://apps.gxn.nvidia.com/graphql'
-    ];
-    var i = 0;
-    (function step() {
-      if (i >= urls.length) { b.textContent = 'PROBE'; return; }
-      var u = urls[i++];
-      fetch('/__probe?u=' + encodeURIComponent(u))
-        .then(function (r) { return r.text(); })
-        .then(function (t) { log('probe', u, '\\n  ' + t.replace(/\\n/g, '\\n  ')); })
-        .catch(function (e) { log('probe', u, 'ERR ' + e.message); })
-        .then(step);
-    })();
   }
 
   function overlay() {
@@ -267,8 +257,8 @@ const SHIM = `(function () {
     title.style.cssText = 'flex:1;font-weight:bold;letter-spacing:.5px';
 
     head.appendChild(title);
+    head.appendChild(mkBtn('LOGIN', runLogin));
     head.appendChild(mkBtn('REDIR', runRedir));
-    head.appendChild(mkBtn('PROBE', runProbe));
     head.appendChild(mkBtn('COPY', copyAll));
     head.appendChild(mkBtn('CLEAR', function () { lines = []; if (list) list.textContent = ''; }));
     head.appendChild(mkBtn('CLOSE', function () {
@@ -707,18 +697,54 @@ function probeLocal(path, headers) {
 const REDIR_CANDIDATES = [
   'https://play.geforcenow.com/callback/redirect',
   'https://play.geforcenow.com/callback/redirect/',
-  'https://play.geforcenow.com/callback/redirect.html',
-  'https://play.geforcenow.com/callback',
-  'https://play.geforcenow.com/callback/',
   'https://play.geforcenow.com/redirect/starfleet-oauth-redirect.html',
   'https://play.geforcenow.com/redirect/starfleet-oauth-redirect-login.html',
-  'https://play.geforcenow.com/redirect/gfn-jarvis-oauth-redirect.html',
-  'https://play.geforcenow.com/redirect/redirect-gfn-oauth.html',
   'https://play.geforcenow.com/mall/',
   'https://play.geforcenow.com/',
 ];
 
-const DEFAULT_CLIENTS = ['310670192232366513', 'W1Z7DwzG1dcpXFxv0pmeatjnf0uK3ICySganqdMx2nU'];
+const STARFLEET_CLIENT = 'W1Z7DwzG1dcpXFxv0pmeatjnf0uK3ICySganqdMx2nU';
+const IDP_ID = 'PDiAhv2kJTFeQ7WOPqiQ2tRZ7lGhR2X11dXvM4TZSxg';
+
+function loginUrl(redirectUri) {
+  const p = new URLSearchParams({
+    response_type: 'code',
+    device_id: '00000000-0000-4000-8000-000000000000',
+    scope: 'openid consent email tk_client age',
+    client_id: STARFLEET_CLIENT,
+    redirect_uri: redirectUri,
+    ui_locales: 'ja_JP',
+    nonce: 'probe-nonce-0001',
+    prompt: 'select_account',
+    code_challenge: 'VJhJYHcNs4_IW7BHKji-UrEMfDv_Ar2-4fbDpcBJBls',
+    code_challenge_method: 'S256',
+    idp_id: IDP_ID,
+  });
+  return 'https://login.nvidia.com/authorize?' + p.toString();
+}
+
+function followChain(url, headers, maxHops) {
+  return new Promise((resolve) => {
+    const statuses = [];
+    let cur = url;
+    let last = url;
+    (async () => {
+      for (let i = 0; i < (maxHops || 6); i++) {
+        last = cur;
+        const p = await probeOnce(cur, 'GET', null, headers);
+        statuses.push(p.status || 0);
+        const loc = p.headers && p.headers.location;
+        if (!loc || [301, 302, 303, 307, 308].indexOf(p.status) === -1) break;
+        try {
+          cur = new URL(loc, cur).href;
+        } catch {
+          break;
+        }
+      }
+      resolve({ statuses, finalUrl: last, ok: !/\/v1\/error/.test(last) });
+    })();
+  });
+}
 
 const app = express();
 app.disable('x-powered-by');
@@ -777,23 +803,38 @@ app.get('/__proxytest', async (req, res) => {
 });
 
 app.get('/__redirtest', async (req, res) => {
-  const cids = req.query.c ? [String(req.query.c)] : DEFAULT_CLIENTS;
   const out = [];
-  for (const cid of cids) {
+  for (const r of REDIR_CANDIDATES) {
+    const u =
+      'https://accounts.nvgs.nvidia.com/api/1/oauth/authorize?response_type=code' +
+      '&scope=openid+profile+email&prompt=select_account&state=probe' +
+      '&client_id=' + encodeURIComponent(STARFLEET_CLIENT) +
+      '&redirect_uri=' + encodeURIComponent(r);
+    const p = await probeOnce(u, 'GET', null, { 'user-agent': UA, accept: 'text/html' });
+    const loc = (p.headers && p.headers.location) || '';
+    out.push({ redirect_uri: r, status: p.status, location: loc.slice(0, 120) });
+  }
+  res.type('application/json');
+  res.send(JSON.stringify({ out }, null, 2));
+});
+
+// 入口から実際にたどって、どこで落ちるかを見る
+app.get('/__loginflow', async (req, res) => {
+  const headerSets = {
+    as_proxy: { 'user-agent': UA, origin: ORIGIN, referer: ORIGIN + '/mall/' },
+    no_origin: { 'user-agent': UA, referer: ORIGIN + '/mall/' },
+    bare: { 'user-agent': UA },
+  };
+  const out = [];
+  for (const [name, h] of Object.entries(headerSets)) {
     for (const r of REDIR_CANDIDATES) {
-      const u =
-        'https://accounts.nvgs.nvidia.com/api/1/oauth/authorize?response_type=code' +
-        '&scope=openid+profile+email&prompt=select_account&state=probe' +
-        '&client_id=' + encodeURIComponent(cid) +
-        '&redirect_uri=' + encodeURIComponent(r);
-      const p = await probeOnce(u, 'GET', null, { 'user-agent': UA, accept: 'text/html' });
-      const loc = (p.headers && p.headers.location) || '';
+      const c = await followChain(loginUrl(r), h, 6);
       out.push({
-        client_id: cid,
+        headers: name,
         redirect_uri: r,
-        status: p.status,
-        accepted: p.status === 302 && !/\/error/.test(loc),
-        location: loc.slice(0, 140),
+        hops: c.statuses.join('>'),
+        ok: c.ok,
+        final: c.finalUrl.slice(0, 150),
       });
     }
   }
