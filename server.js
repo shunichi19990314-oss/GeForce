@@ -46,7 +46,8 @@ function mapUrl(value, base) {
   return PREFIX + abs;
 }
 
-function fixRedirectUri(v) {
+// 自分のプロキシホストを指すときだけ本来のドメインへ寄せる
+function fixRedirectUri(v, selfHost) {
   if (!v) return v;
   let s = String(v);
   if (s.startsWith(PREFIX)) s = s.slice(PREFIX.length);
@@ -58,22 +59,25 @@ function fixRedirectUri(v) {
       return v;
     }
     if (ru.host === ORIGIN_HOST) return s;
-    return ORIGIN + ru.pathname + ru.search + ru.hash;
+    if (selfHost && ru.host.toLowerCase() === selfHost) {
+      return ORIGIN + ru.pathname + ru.search + ru.hash;
+    }
+    return s;
   }
   if (s.startsWith('/')) return ORIGIN + s;
   return v;
 }
 
-function rewriteRedirectInUrl(u) {
+function rewriteRedirectInUrl(u, selfHost) {
   const v = u.searchParams.get('redirect_uri');
   if (!v) return null;
-  const f = fixRedirectUri(v);
+  const f = fixRedirectUri(v, selfHost);
   if (f === v) return null;
   u.searchParams.set('redirect_uri', f);
   return f;
 }
 
-function rewriteRedirectInForm(s) {
+function rewriteRedirectInForm(s, selfHost) {
   let changed = false;
   const out = s.replace(/(^|&)redirect_uri=([^&]*)/g, (m, pre, val) => {
     let dec;
@@ -82,7 +86,7 @@ function rewriteRedirectInForm(s) {
     } catch {
       return m;
     }
-    const f = fixRedirectUri(dec);
+    const f = fixRedirectUri(dec, selfHost);
     if (f === dec) return m;
     changed = true;
     return pre + 'redirect_uri=' + encodeURIComponent(f);
@@ -831,7 +835,6 @@ app.get('/__proxytest', async (req, res) => {
   res.send(JSON.stringify({ url: u, result: r, recent: LOG.slice(-6) }, null, 2));
 });
 
-// 成功時の中間ホップを全部記録する
 app.get('/__loginflow', async (req, res) => {
   const dev = req.query.d ? String(req.query.d) : null;
   const headerSets = {
@@ -877,7 +880,8 @@ app.get('/__probe', async (req, res) => {
 });
 
 async function prepare(req, target) {
-  const fixed = rewriteRedirectInUrl(target);
+  const selfHost = String(req.headers.host || '').toLowerCase();
+  const fixed = rewriteRedirectInUrl(target, selfHost);
   if (fixed) pushLog({ t: Date.now(), redirectFixed: fixed, url: target.href });
 
   const ct = String(req.headers['content-type'] || '').toLowerCase();
@@ -890,7 +894,7 @@ async function prepare(req, target) {
   ) {
     const buf = await readAll(req);
     const s = buf.toString('utf8');
-    const ns = rewriteRedirectInForm(s);
+    const ns = rewriteRedirectInForm(s, selfHost);
     req.__body = Buffer.from(ns === null ? s : ns, 'utf8');
     req.__bodySet = true;
     if (ns !== null) pushLog({ t: Date.now(), redirectFixedBody: target.href });
