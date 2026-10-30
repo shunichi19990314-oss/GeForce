@@ -96,7 +96,8 @@ function rewriteRedirectInForm(s, selfHost) {
 function rewriteHtml(html, base) {
   const $ = cheerio.load(html);
 
-  // 別ホストのページは <base href="/"> がルート解決になり、相対 import が壊れる
+  // 別ホストのページは <base href="/"> がルート解決になり、相対 import が壊れる。
+  // base は「プロキシ上のパス」でなければならない。
   let baseHost = ORIGIN_HOST;
   try {
     baseHost = new URL(base).host;
@@ -104,7 +105,7 @@ function rewriteHtml(html, base) {
   if (baseHost !== ORIGIN_HOST) {
     const clean = base.replace(/[?#].*$/, '');
     const idx = clean.lastIndexOf('/');
-    const dir = idx >= 0 ? clean.slice(0, idx + 1) : base;
+    const dir = PREFIX + (idx >= 0 ? clean.slice(0, idx + 1) : clean + '/');
     $('base').remove();
     $('head').prepend(`<base href="${dir}">`);
   }
@@ -315,6 +316,18 @@ const SHIM = `(function () {
   }
 
   function ref() { try { return base(); } catch (e) { return ''; } }
+
+  // リソース読み込み失敗とJS例外を拾う
+  window.addEventListener('error', function (e) {
+    var t = e && e.target;
+    if (t && t !== window && (t.src || t.href)) log('res', t.src || t.href, 'FAIL');
+    else if (e && e.message) log('err', '', e.message);
+  }, true);
+
+  window.addEventListener('unhandledrejection', function (e) {
+    var r = e && e.reason;
+    log('rej', '', (r && (r.message || r)) || 'unknown');
+  });
 
   var of = window.fetch;
   window.fetch = function (input, init) {
