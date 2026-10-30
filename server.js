@@ -226,6 +226,15 @@ const SHIM = `(function () {
     }
   }
 
+  function runClear(b) {
+    b.textContent = 'RUNNING';
+    fetch('/__clearcookies')
+      .then(function (r) { return r.text(); })
+      .then(function (t) { log('clearcookies', '', t.trim()); })
+      .catch(function (e) { log('clearcookies', '', 'ERR ' + e.message); })
+      .then(function () { b.textContent = 'CLR'; });
+  }
+
   function runLogin(b) {
     b.textContent = 'RUNNING';
     fetch('/__loginflow')
@@ -233,15 +242,6 @@ const SHIM = `(function () {
       .then(function (t) { log('loginflow', '', '\\n  ' + t.replace(/\\n/g, '\\n  ')); })
       .catch(function (e) { log('loginflow', '', 'ERR ' + e.message); })
       .then(function () { b.textContent = 'LOGIN'; });
-  }
-
-  function runRedir(b) {
-    b.textContent = 'RUNNING';
-    fetch('/__redirtest')
-      .then(function (r) { return r.text(); })
-      .then(function (t) { log('redirtest', '', '\\n  ' + t.replace(/\\n/g, '\\n  ')); })
-      .catch(function (e) { log('redirtest', '', 'ERR ' + e.message); })
-      .then(function () { b.textContent = 'REDIR'; });
   }
 
   function overlay() {
@@ -258,7 +258,7 @@ const SHIM = `(function () {
 
     head.appendChild(title);
     head.appendChild(mkBtn('LOGIN', runLogin));
-    head.appendChild(mkBtn('REDIR', runRedir));
+    head.appendChild(mkBtn('CLR', runClear));
     head.appendChild(mkBtn('COPY', copyAll));
     head.appendChild(mkBtn('CLEAR', function () { lines = []; if (list) list.textContent = ''; }));
     head.appendChild(mkBtn('CLOSE', function () {
@@ -462,6 +462,7 @@ function proxyFor(origin) {
   if (proxyCache.has(origin)) return proxyCache.get(origin);
 
   const targetHost = new URL(origin).host;
+  const isMainHost = targetHost === ORIGIN_HOST;
 
   const mw = createProxyMiddleware({
     target: origin,
@@ -470,8 +471,6 @@ function proxyFor(origin) {
     ws: true,
     secure: true,
     selfHandleResponse: true,
-    cookieDomainRewrite: '',
-    cookiePathRewrite: '/',
     proxyTimeout: 180000,
     timeout: 180000,
 
@@ -520,6 +519,18 @@ function proxyFor(origin) {
         'strict-transport-security',
       ]) {
         delete h[k];
+      }
+
+      // Cookie をホスト単位に閉じ込める（別ホストへ漏らすと state 検証が壊れる）
+      const cookiePath = isMainHost ? '/' : PREFIX + origin + '/';
+      if (h['set-cookie']) {
+        const arr = Array.isArray(h['set-cookie']) ? h['set-cookie'] : [h['set-cookie']];
+        h['set-cookie'] = arr.map((c) => {
+          let out = String(c).replace(/;\s*domain=[^;]*/gi, '');
+          if (/;\s*path=/i.test(out)) out = out.replace(/;\s*path=[^;]*/gi, '; Path=' + cookiePath);
+          else out += '; Path=' + cookiePath;
+          return out;
+        });
       }
 
       if (h.location) h.location = mapUrl(h.location, req.__target || ORIGIN);
@@ -695,16 +706,20 @@ function probeLocal(path, headers) {
 }
 
 const REDIR_CANDIDATES = [
-  'https://play.geforcenow.com/callback/redirect',
-  'https://play.geforcenow.com/callback/redirect/',
   'https://play.geforcenow.com/redirect/starfleet-oauth-redirect.html',
   'https://play.geforcenow.com/redirect/starfleet-oauth-redirect-login.html',
-  'https://play.geforcenow.com/mall/',
-  'https://play.geforcenow.com/',
+  'https://play.geforcenow.com/callback/redirect',
 ];
 
 const STARFLEET_CLIENT = 'W1Z7DwzG1dcpXFxv0pmeatjnf0uK3ICySganqdMx2nU';
 const IDP_ID = 'PDiAhv2kJTFeQ7WOPqiQ2tRZ7lGhR2X11dXvM4TZSxg';
+const COOKIE_HOSTS = [
+  'play.geforcenow.com',
+  'login.nvidia.com',
+  'login.nvgs.nvidia.com',
+  'accounts.nvgs.nvidia.com',
+  'accounts.nvidia.com',
+];
 
 function loginUrl(redirectUri) {
   const p = new URLSearchParams({
@@ -775,6 +790,23 @@ app.get('/__shim.js', (req, res) => {
   res.send(SHIM);
 });
 
+// 全 Cookie を失効させる
+app.get('/__clearcookies', (req, res) => {
+  const raw = String(req.headers.cookie || '');
+  const names = raw
+    .split(';')
+    .map((c) => c.split('=')[0].trim())
+    .filter(Boolean);
+  const out = [];
+  for (const n of names) {
+    out.push(`${n}=; Path=/; Max-Age=0`);
+    for (const h of COOKIE_HOSTS) out.push(`${n}=; Path=${PREFIX}https://${h}/; Max-Age=0`);
+  }
+  if (out.length) res.setHeader('set-cookie', out);
+  res.type('text/plain');
+  res.send('cleared ' + names.length + ' cookie(s)');
+});
+
 app.get('/__selftest', async (req, res) => {
   const r = await probeOnce(ORIGIN + '/mall/', 'GET', null, {
     'user-agent': UA,
@@ -802,40 +834,16 @@ app.get('/__proxytest', async (req, res) => {
   res.send(JSON.stringify({ url: u, result: r, recent: LOG.slice(-6) }, null, 2));
 });
 
-app.get('/__redirtest', async (req, res) => {
-  const out = [];
-  for (const r of REDIR_CANDIDATES) {
-    const u =
-      'https://accounts.nvgs.nvidia.com/api/1/oauth/authorize?response_type=code' +
-      '&scope=openid+profile+email&prompt=select_account&state=probe' +
-      '&client_id=' + encodeURIComponent(STARFLEET_CLIENT) +
-      '&redirect_uri=' + encodeURIComponent(r);
-    const p = await probeOnce(u, 'GET', null, { 'user-agent': UA, accept: 'text/html' });
-    const loc = (p.headers && p.headers.location) || '';
-    out.push({ redirect_uri: r, status: p.status, location: loc.slice(0, 120) });
-  }
-  res.type('application/json');
-  res.send(JSON.stringify({ out }, null, 2));
-});
-
-// 入口から実際にたどって、どこで落ちるかを見る
 app.get('/__loginflow', async (req, res) => {
   const headerSets = {
     as_proxy: { 'user-agent': UA, origin: ORIGIN, referer: ORIGIN + '/mall/' },
-    no_origin: { 'user-agent': UA, referer: ORIGIN + '/mall/' },
     bare: { 'user-agent': UA },
   };
   const out = [];
   for (const [name, h] of Object.entries(headerSets)) {
     for (const r of REDIR_CANDIDATES) {
       const c = await followChain(loginUrl(r), h, 6);
-      out.push({
-        headers: name,
-        redirect_uri: r,
-        hops: c.statuses.join('>'),
-        ok: c.ok,
-        final: c.finalUrl.slice(0, 150),
-      });
+      out.push({ headers: name, redirect_uri: r, hops: c.statuses.join('>'), ok: c.ok, final: c.finalUrl.slice(0, 130) });
     }
   }
   res.type('application/json');
