@@ -521,7 +521,6 @@ function proxyFor(origin) {
         delete h[k];
       }
 
-      // Cookie をホスト単位に閉じ込める（別ホストへ漏らすと state 検証が壊れる）
       const cookiePath = isMainHost ? '/' : PREFIX + origin + '/';
       if (h['set-cookie']) {
         const arr = Array.isArray(h['set-cookie']) ? h['set-cookie'] : [h['set-cookie']];
@@ -721,10 +720,10 @@ const COOKIE_HOSTS = [
   'accounts.nvidia.com',
 ];
 
-function loginUrl(redirectUri) {
+function loginUrl(redirectUri, deviceId) {
   const p = new URLSearchParams({
     response_type: 'code',
-    device_id: '00000000-0000-4000-8000-000000000000',
+    device_id: deviceId || '00000000-0000-4000-8000-000000000000',
     scope: 'openid consent email tk_client age',
     client_id: STARFLEET_CLIENT,
     redirect_uri: redirectUri,
@@ -740,14 +739,12 @@ function loginUrl(redirectUri) {
 
 function followChain(url, headers, maxHops) {
   return new Promise((resolve) => {
-    const statuses = [];
+    const hops = [];
     let cur = url;
-    let last = url;
     (async () => {
       for (let i = 0; i < (maxHops || 6); i++) {
-        last = cur;
         const p = await probeOnce(cur, 'GET', null, headers);
-        statuses.push(p.status || 0);
+        hops.push({ status: p.status || 0, url: cur.slice(0, 200) });
         const loc = p.headers && p.headers.location;
         if (!loc || [301, 302, 303, 307, 308].indexOf(p.status) === -1) break;
         try {
@@ -756,7 +753,8 @@ function followChain(url, headers, maxHops) {
           break;
         }
       }
-      resolve({ statuses, finalUrl: last, ok: !/\/v1\/error/.test(last) });
+      const last = hops.length ? hops[hops.length - 1].url : '';
+      resolve({ hops, ok: !/\/v1\/error/.test(last) });
     })();
   });
 }
@@ -790,7 +788,6 @@ app.get('/__shim.js', (req, res) => {
   res.send(SHIM);
 });
 
-// 全 Cookie を失効させる
 app.get('/__clearcookies', (req, res) => {
   const raw = String(req.headers.cookie || '');
   const names = raw
@@ -834,7 +831,9 @@ app.get('/__proxytest', async (req, res) => {
   res.send(JSON.stringify({ url: u, result: r, recent: LOG.slice(-6) }, null, 2));
 });
 
+// 成功時の中間ホップを全部記録する
 app.get('/__loginflow', async (req, res) => {
+  const dev = req.query.d ? String(req.query.d) : null;
   const headerSets = {
     as_proxy: { 'user-agent': UA, origin: ORIGIN, referer: ORIGIN + '/mall/' },
     bare: { 'user-agent': UA },
@@ -842,8 +841,8 @@ app.get('/__loginflow', async (req, res) => {
   const out = [];
   for (const [name, h] of Object.entries(headerSets)) {
     for (const r of REDIR_CANDIDATES) {
-      const c = await followChain(loginUrl(r), h, 6);
-      out.push({ headers: name, redirect_uri: r, hops: c.statuses.join('>'), ok: c.ok, final: c.finalUrl.slice(0, 130) });
+      const c = await followChain(loginUrl(r, dev), h, 6);
+      out.push({ headers: name, redirect_uri: r, ok: c.ok, hops: c.hops });
     }
   }
   res.type('application/json');
