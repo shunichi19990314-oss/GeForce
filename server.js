@@ -96,11 +96,15 @@ function rewriteRedirectInForm(s, selfHost) {
 function rewriteHtml(html, base) {
   const $ = cheerio.load(html);
 
-  // 元の <base href> をプロキシ形式へ変換する（"/" は元ホストのルートを意味する）
-  $('base[href]').each((_, el) => {
-    const v = $(el).attr('href');
-    if (v) $(el).attr('href', mapUrl(v, base));
-  });
+  // 相対URLの解決基準は <base href> があればそれ（例: "/" = 元ホストのルート）
+  let effBase = base;
+  const baseAttr = $('base[href]').attr('href');
+  if (baseAttr) {
+    try {
+      effBase = new URL(baseAttr, base).href;
+    } catch {}
+    $('base[href]').attr('href', mapUrl(baseAttr, base));
+  }
 
   const pairs = [
     ['script', 'src'],
@@ -120,7 +124,7 @@ function rewriteHtml(html, base) {
     $(sel).each((_, el) => {
       const v = $(el).attr(attr);
       if (!v) return;
-      $(el).attr(attr, mapUrl(v, base));
+      $(el).attr(attr, mapUrl(v, effBase));
     });
   }
 
@@ -133,7 +137,7 @@ function rewriteHtml(html, base) {
         .split(',')
         .map((part) => {
           const [u, d] = part.trim().split(/\s+/);
-          return mapUrl(u, base) + (d ? ' ' + d : '');
+          return mapUrl(u, effBase) + (d ? ' ' + d : '');
         })
         .join(', ')
     );
@@ -143,7 +147,7 @@ function rewriteHtml(html, base) {
     const c = $(el).attr('content');
     if (!c) return;
     const m = c.match(/url\s*=\s*(.+)$/i);
-    if (m) $(el).attr('content', c.replace(m[1], mapUrl(m[1].trim(), base)));
+    if (m) $(el).attr('content', c.replace(m[1], mapUrl(m[1].trim(), effBase)));
   });
 
   $('script[integrity], link[integrity]').removeAttr('integrity');
