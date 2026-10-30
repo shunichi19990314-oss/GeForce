@@ -46,7 +46,6 @@ function mapUrl(value, base) {
   return PREFIX + abs;
 }
 
-// redirect_uri を本来のドメインへ寄せる
 function fixRedirectUri(v) {
   if (!v) return v;
   let s = String(v);
@@ -226,12 +225,20 @@ const SHIM = `(function () {
     }
   }
 
+  function runRedir(b) {
+    b.textContent = 'RUNNING';
+    fetch('/__redirtest')
+      .then(function (r) { return r.text(); })
+      .then(function (t) { log('redirtest', '', '\\n  ' + t.replace(/\\n/g, '\\n  ')); })
+      .catch(function (e) { log('redirtest', '', 'ERR ' + e.message); })
+      .then(function () { b.textContent = 'REDIR'; });
+  }
+
   function runProbe(b) {
     b.textContent = 'RUNNING';
     var urls = [
       'https://pcs.geforcenow.com/v1/serviceUrls',
-      'https://apps.gxn.nvidia.com/graphql',
-      'https://gx-target-experiments-frontend-api.gx.nvidia.com/cloudvariables/v3'
+      'https://apps.gxn.nvidia.com/graphql'
     ];
     var i = 0;
     (function step() {
@@ -243,10 +250,6 @@ const SHIM = `(function () {
         .catch(function (e) { log('probe', u, 'ERR ' + e.message); })
         .then(step);
     })();
-    fetch('/__proxytest?u=' + encodeURIComponent(urls[0]))
-      .then(function (r) { return r.text(); })
-      .then(function (t) { log('pxtest', urls[0], '\\n  ' + t.replace(/\\n/g, '\\n  ')); })
-      .catch(function (e) { log('pxtest', urls[0], 'ERR ' + e.message); });
   }
 
   function overlay() {
@@ -262,6 +265,7 @@ const SHIM = `(function () {
     title.style.cssText = 'flex:1;font-weight:bold;letter-spacing:.5px';
 
     head.appendChild(title);
+    head.appendChild(mkBtn('REDIR', runRedir));
     head.appendChild(mkBtn('PROBE', runProbe));
     head.appendChild(mkBtn('COPY', copyAll));
     head.appendChild(mkBtn('CLEAR', function () { lines = []; if (list) list.textContent = ''; }));
@@ -614,10 +618,10 @@ function probeOnce(url, method, body, headers) {
           } catch {}
           const keep = {};
           for (const k of Object.keys(resp.headers)) {
-            if (/^(server|via|x-cache|x-amz|akamai|cf-|x-akamai|x-served|x-nv|content-type)/i.test(k))
+            if (/^(server|via|x-cache|x-amz|akamai|cf-|x-akamai|x-served|x-nv|content-type|location)/i.test(k))
               keep[k] = resp.headers[k];
           }
-          resolve({ status: resp.statusCode, headers: keep, body: b.toString('utf8').slice(0, 400) });
+          resolve({ status: resp.statusCode, headers: keep, body: b.toString('utf8').slice(0, 300) });
         });
       }
     );
@@ -698,6 +702,20 @@ function probeLocal(path, headers) {
   });
 }
 
+const REDIR_CANDIDATES = [
+  'https://play.geforcenow.com/callback/redirect',
+  'https://play.geforcenow.com/callback/redirect/',
+  'https://play.geforcenow.com/callback/redirect.html',
+  'https://play.geforcenow.com/callback',
+  'https://play.geforcenow.com/callback/',
+  'https://play.geforcenow.com/redirect/starfleet-oauth-redirect.html',
+  'https://play.geforcenow.com/redirect/starfleet-oauth-redirect-login.html',
+  'https://play.geforcenow.com/redirect/gfn-jarvis-oauth-redirect.html',
+  'https://play.geforcenow.com/redirect/redirect-gfn-oauth.html',
+  'https://play.geforcenow.com/mall/',
+  'https://play.geforcenow.com/',
+];
+
 const app = express();
 app.disable('x-powered-by');
 app.disable('etag');
@@ -754,6 +772,29 @@ app.get('/__proxytest', async (req, res) => {
   res.send(JSON.stringify({ url: u, result: r, recent: LOG.slice(-6) }, null, 2));
 });
 
+// redirect_uri の受理値を総当たりで探す
+app.get('/__redirtest', async (req, res) => {
+  const cid = String(req.query.c || '310670192232366513');
+  const out = [];
+  for (const r of REDIR_CANDIDATES) {
+    const u =
+      'https://accounts.nvgs.nvidia.com/api/1/oauth/authorize?response_type=code' +
+      '&scope=openid+profile+email&prompt=select_account&state=probe' +
+      '&client_id=' + encodeURIComponent(cid) +
+      '&redirect_uri=' + encodeURIComponent(r);
+    const p = await probeOnce(u, 'GET', null, { 'user-agent': UA, accept: 'text/html' });
+    const loc = (p.headers && p.headers.location) || '';
+    out.push({
+      redirect_uri: r,
+      status: p.status,
+      accepted: p.status === 302 && !/\/error/.test(loc),
+      location: loc.slice(0, 160),
+    });
+  }
+  res.type('application/json');
+  res.send(JSON.stringify({ client_id: cid, out }, null, 2));
+});
+
 app.get('/__probe', async (req, res) => {
   const selfHost = String(req.headers.host || '').toLowerCase();
   const t = normalizeTarget(String(req.query.u || ''), selfHost);
@@ -775,12 +816,6 @@ app.get('/__probe', async (req, res) => {
   const out = {};
   out.A_bare = await probeOnce(t.href, method, body, { ...base, host: t.host });
   out.B_browserish = await probeOnce(t.href, method, body, { ...browserish });
-  out.C_with_forwarded = await probeOnce(t.href, method, body, {
-    ...browserish,
-    'x-forwarded-for': req.headers['x-forwarded-for'] || '203.0.113.9',
-    'x-forwarded-host': selfHost,
-    'x-forwarded-proto': 'https',
-  });
   out.D_http2 = await probeH2(t.href, method, body, { ...browserish });
 
   res.type('application/json');
