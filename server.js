@@ -46,7 +46,6 @@ function mapUrl(value, base) {
   return PREFIX + abs;
 }
 
-// 自分のプロキシホストを指すときだけ本来のドメインへ寄せる
 function fixRedirectUri(v, selfHost) {
   if (!v) return v;
   let s = String(v);
@@ -96,6 +95,19 @@ function rewriteRedirectInForm(s, selfHost) {
 
 function rewriteHtml(html, base) {
   const $ = cheerio.load(html);
+
+  // 別ホストのページは <base href="/"> がルート解決になり、相対 import が壊れる
+  let baseHost = ORIGIN_HOST;
+  try {
+    baseHost = new URL(base).host;
+  } catch {}
+  if (baseHost !== ORIGIN_HOST) {
+    const clean = base.replace(/[?#].*$/, '');
+    const idx = clean.lastIndexOf('/');
+    const dir = idx >= 0 ? clean.slice(0, idx + 1) : base;
+    $('base').remove();
+    $('head').prepend(`<base href="${dir}">`);
+  }
 
   const pairs = [
     ['script', 'src'],
