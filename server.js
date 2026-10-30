@@ -13,6 +13,7 @@ const PORT = Number(process.env.PORT || 3000);
 const ORIGIN = 'https://play.geforcenow.com';
 const ORIGIN_HOST = new URL(ORIGIN).host;
 const PREFIX = '/__p/';
+const MAX_BODY = 2 * 1024 * 1024;
 
 const BLOCK_RE = /(^|\.)(doubleclick\.net|googletagmanager\.com|google-analytics\.com)$/i;
 
@@ -43,6 +44,51 @@ function mapUrl(value, base) {
   const u = new URL(abs);
   if (u.host === ORIGIN_HOST) return u.pathname + u.search + u.hash;
   return PREFIX + abs;
+}
+
+// redirect_uri を本来のドメインへ寄せる
+function fixRedirectUri(v) {
+  if (!v) return v;
+  let s = String(v);
+  if (s.startsWith(PREFIX)) s = s.slice(PREFIX.length);
+  if (/^https?:\/\//i.test(s)) {
+    let ru;
+    try {
+      ru = new URL(s);
+    } catch {
+      return v;
+    }
+    if (ru.host === ORIGIN_HOST) return s;
+    return ORIGIN + ru.pathname + ru.search + ru.hash;
+  }
+  if (s.startsWith('/')) return ORIGIN + s;
+  return v;
+}
+
+function rewriteRedirectInUrl(u) {
+  const v = u.searchParams.get('redirect_uri');
+  if (!v) return null;
+  const f = fixRedirectUri(v);
+  if (f === v) return null;
+  u.searchParams.set('redirect_uri', f);
+  return f;
+}
+
+function rewriteRedirectInForm(s) {
+  let changed = false;
+  const out = s.replace(/(^|&)redirect_uri=([^&]*)/g, (m, pre, val) => {
+    let dec;
+    try {
+      dec = decodeURIComponent(val.replace(/\+/g, ' '));
+    } catch {
+      return m;
+    }
+    const f = fixRedirectUri(dec);
+    if (f === dec) return m;
+    changed = true;
+    return pre + 'redirect_uri=' + encodeURIComponent(f);
+  });
+  return changed ? out : null;
 }
 
 function rewriteHtml(html, base) {
@@ -405,6 +451,15 @@ function decodeBody(buf, enc) {
   return buf;
 }
 
+function readAll(req) {
+  return new Promise((resolve) => {
+    const chunks = [];
+    req.on('data', (c) => chunks.push(c));
+    req.on('end', () => resolve(Buffer.concat(chunks)));
+    req.on('error', () => resolve(Buffer.concat(chunks)));
+  });
+}
+
 const proxyCache = new Map();
 
 function proxyFor(origin) {
@@ -424,7 +479,6 @@ function proxyFor(origin) {
     proxyTimeout: 180000,
     timeout: 180000,
 
-    // req.url は Express に復元されることがあるため、送るパスは自前の値で確定させる
     pathRewrite: (p, req) => req.__path || p,
 
     onProxyReq(proxyReq, req) {
@@ -447,6 +501,13 @@ function proxyFor(origin) {
       proxyReq.removeHeader('x-gfn-ref');
       proxyReq.removeHeader('if-none-match');
       proxyReq.removeHeader('if-modified-since');
+
+      if (req.__bodySet) {
+        proxyReq.removeHeader('transfer-encoding');
+        proxyReq.setHeader('content-length', String(req.__body.length));
+        proxyReq.write(req.__body);
+        proxyReq.end();
+      }
 
       pushLog({ t: Date.now(), sent: `${req.method} https://${targetHost}${req.__path}` });
     },
@@ -556,7 +617,7 @@ function probeOnce(url, method, body, headers) {
             if (/^(server|via|x-cache|x-amz|akamai|cf-|x-akamai|x-served|x-nv|content-type)/i.test(k))
               keep[k] = resp.headers[k];
           }
-          resolve({ status: resp.statusCode, headers: keep, body: b.toString('utf8').slice(0, 500) });
+          resolve({ status: resp.statusCode, headers: keep, body: b.toString('utf8').slice(0, 400) });
         });
       }
     );
@@ -603,7 +664,7 @@ function probeH2(url, method, body, headers) {
       });
       r.on('data', (d) => chunks.push(d));
       r.on('end', () =>
-        done({ status, headers: hdrs, body: Buffer.concat(chunks).toString('utf8').slice(0, 400) })
+        done({ status, headers: hdrs, body: Buffer.concat(chunks).toString('utf8').slice(0, 300) })
       );
       r.on('error', (e) => done({ error: e.message }));
       if (body) r.write(body);
@@ -623,7 +684,7 @@ function probeLocal(path, headers) {
           resolve({
             status: resp.statusCode,
             contentType: resp.headers['content-type'],
-            body: Buffer.concat(chunks).toString('utf8').slice(0, 300),
+            body: Buffer.concat(chunks).toString('utf8').slice(0, 250),
           })
         );
       }
@@ -726,11 +787,37 @@ app.get('/__probe', async (req, res) => {
   res.send(JSON.stringify({ target: t.href, method, out }, null, 2));
 });
 
-app.use(PREFIX, (req, res, next) => {
+async function prepare(req, target) {
+  const fixed = rewriteRedirectInUrl(target);
+  if (fixed) pushLog({ t: Date.now(), redirectFixed: fixed, url: target.href });
+
+  const ct = String(req.headers['content-type'] || '').toLowerCase();
+  const len = Number(req.headers['content-length'] || 0);
+  if (
+    (req.method === 'POST' || req.method === 'PUT') &&
+    ct.includes('x-www-form-urlencoded') &&
+    len > 0 &&
+    len <= MAX_BODY
+  ) {
+    const buf = await readAll(req);
+    const s = buf.toString('utf8');
+    const ns = rewriteRedirectInForm(s);
+    req.__body = Buffer.from(ns === null ? s : ns, 'utf8');
+    req.__bodySet = true;
+    if (ns !== null) pushLog({ t: Date.now(), redirectFixedBody: target.href });
+  }
+}
+
+app.use(PREFIX, async (req, res, next) => {
   const selfHost = String(req.headers.host || '').toLowerCase();
   const target = normalizeTarget(req.originalUrl.slice(PREFIX.length), selfHost);
   if (!target) return res.status(400).type('text/plain').send('Bad URL');
   if (!shouldProxy(target.href)) return res.status(403).type('text/plain').send('Not proxied: ' + target.host);
+
+  try {
+    await prepare(req, target);
+  } catch {}
+
   req.__target = target.href;
   req.__path = target.pathname + target.search;
   req.url = req.__path;
@@ -741,9 +828,14 @@ app.use(PREFIX, (req, res, next) => {
   });
 });
 
-app.use((req, res, next) => {
-  req.__target = ORIGIN + req.originalUrl;
-  req.__path = req.originalUrl;
+app.use(async (req, res, next) => {
+  const target = new URL(ORIGIN + req.originalUrl);
+  try {
+    await prepare(req, target);
+  } catch {}
+
+  req.__target = target.href;
+  req.__path = target.pathname + target.search;
   return proxyFor(ORIGIN)(req, res, () => res.status(502).type('text/plain').send('no handler'));
 });
 
