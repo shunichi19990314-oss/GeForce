@@ -172,6 +172,8 @@ const SHIM = `(function () {
     if (u == null) return u;
     var s = String(u);
     if (/^(data:|blob:|javascript:|about:|#)/i.test(s)) return u;
+    // 内部エンドポイントは素通し
+    if (s.indexOf('/__') === 0) return s;
     var a;
     try { a = new URL(s, base()).href; } catch (e) { return u; }
     if (a.indexOf(location.origin + P) === 0) return a.slice(location.origin.length);
@@ -716,6 +718,8 @@ const REDIR_CANDIDATES = [
   'https://play.geforcenow.com/',
 ];
 
+const DEFAULT_CLIENTS = ['310670192232366513', 'W1Z7DwzG1dcpXFxv0pmeatjnf0uK3ICySganqdMx2nU'];
+
 const app = express();
 app.disable('x-powered-by');
 app.disable('etag');
@@ -772,27 +776,29 @@ app.get('/__proxytest', async (req, res) => {
   res.send(JSON.stringify({ url: u, result: r, recent: LOG.slice(-6) }, null, 2));
 });
 
-// redirect_uri の受理値を総当たりで探す
 app.get('/__redirtest', async (req, res) => {
-  const cid = String(req.query.c || '310670192232366513');
+  const cids = req.query.c ? [String(req.query.c)] : DEFAULT_CLIENTS;
   const out = [];
-  for (const r of REDIR_CANDIDATES) {
-    const u =
-      'https://accounts.nvgs.nvidia.com/api/1/oauth/authorize?response_type=code' +
-      '&scope=openid+profile+email&prompt=select_account&state=probe' +
-      '&client_id=' + encodeURIComponent(cid) +
-      '&redirect_uri=' + encodeURIComponent(r);
-    const p = await probeOnce(u, 'GET', null, { 'user-agent': UA, accept: 'text/html' });
-    const loc = (p.headers && p.headers.location) || '';
-    out.push({
-      redirect_uri: r,
-      status: p.status,
-      accepted: p.status === 302 && !/\/error/.test(loc),
-      location: loc.slice(0, 160),
-    });
+  for (const cid of cids) {
+    for (const r of REDIR_CANDIDATES) {
+      const u =
+        'https://accounts.nvgs.nvidia.com/api/1/oauth/authorize?response_type=code' +
+        '&scope=openid+profile+email&prompt=select_account&state=probe' +
+        '&client_id=' + encodeURIComponent(cid) +
+        '&redirect_uri=' + encodeURIComponent(r);
+      const p = await probeOnce(u, 'GET', null, { 'user-agent': UA, accept: 'text/html' });
+      const loc = (p.headers && p.headers.location) || '';
+      out.push({
+        client_id: cid,
+        redirect_uri: r,
+        status: p.status,
+        accepted: p.status === 302 && !/\/error/.test(loc),
+        location: loc.slice(0, 140),
+      });
+    }
   }
   res.type('application/json');
-  res.send(JSON.stringify({ client_id: cid, out }, null, 2));
+  res.send(JSON.stringify({ out }, null, 2));
 });
 
 app.get('/__probe', async (req, res) => {
