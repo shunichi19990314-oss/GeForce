@@ -323,36 +323,27 @@ const SHIM = `(function () {
     log('rej', '', (r && (r.message || r)) || 'unknown');
   });
 
+  // ---- location 差し替え（prototype のアクセサを直接書き換える）----
   try {
-    var LP = window.Location && window.Location.prototype;
-    if (LP) {
-      var oAssign = LP.assign, oReplace = LP.replace;
-      LP.assign = function (u) { log('nav', u, 'assign'); return oAssign.call(this, map(u)); };
-      LP.replace = function (u) { log('nav', u, 'replace'); return oReplace.call(this, map(u)); };
+    var lp = window.Location && window.Location.prototype;
+    if (lp) {
+      var oAssign = lp.assign;
+      var oReplace = lp.replace;
+      if (oAssign) lp.assign = function (u) { log('nav', u, 'assign'); return oAssign.call(this, map(u)); };
+      if (oReplace) lp.replace = function (u) { log('nav', u, 'replace'); return oReplace.call(this, map(u)); };
+
+      var hd = Object.getOwnPropertyDescriptor(lp, 'href');
+      if (hd && hd.set && hd.get) {
+        Object.defineProperty(lp, 'href', {
+          configurable: true,
+          enumerable: hd.enumerable,
+          get: function () { return hd.get.call(this); },
+          set: function (v) { log('nav', v, 'href'); hd.set.call(this, map(v)); }
+        });
+      }
     }
   } catch (e) {}
 
-  try {
-    var realLoc = window.location;
-    Object.defineProperty(window, 'location', {
-      configurable: true,
-      get: function () {
-        return new Proxy(realLoc, {
-          get: function (t, k) {
-            var v = t[k];
-            return typeof v === 'function' ? v.bind(t) : v;
-          },
-          set: function (t, k, v) {
-            if (k === 'href') { log('nav', v, 'href'); t.href = map(v); return true; }
-            t[k] = v;
-            return true;
-          }
-        });
-      }
-    });
-  } catch (e) {}
-
-  // 第2引数（_self など）を落とすとタブ文脈が切れる
   var oo = window.open;
   window.open = function () {
     var a = [].slice.call(arguments);
