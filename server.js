@@ -96,7 +96,6 @@ function rewriteRedirectInForm(s, selfHost) {
 function rewriteHtml(html, base) {
   const $ = cheerio.load(html);
 
-  // 相対URLの解決基準は <base href> があればそれ（例: "/" = 元ホストのルート）
   let effBase = base;
   const baseAttr = $('base[href]').attr('href');
   if (baseAttr) {
@@ -323,6 +322,36 @@ const SHIM = `(function () {
     var r = e && e.reason;
     log('rej', '', (r && (r.message || r)) || 'unknown');
   });
+
+  // ---- ナビゲーションの差し替え（JS の location 遷移対策）----
+  try {
+    var LP = window.Location && window.Location.prototype;
+    if (LP) {
+      var oAssign = LP.assign, oReplace = LP.replace;
+      LP.assign = function (u) { log('nav', u, 'assign'); return oAssign.call(this, map(u)); };
+      LP.replace = function (u) { log('nav', u, 'replace'); return oReplace.call(this, map(u)); };
+    }
+  } catch (e) {}
+
+  try {
+    var realLoc = window.location;
+    Object.defineProperty(window, 'location', {
+      configurable: true,
+      get: function () {
+        return new Proxy(realLoc, {
+          get: function (t, k) {
+            var v = t[k];
+            return typeof v === 'function' ? v.bind(t) : v;
+          },
+          set: function (t, k, v) {
+            if (k === 'href') { log('nav', v, 'href'); t.href = map(v); return true; }
+            t[k] = v;
+            return true;
+          }
+        });
+      }
+    });
+  } catch (e) {}
 
   var of = window.fetch;
   window.fetch = function (input, init) {
