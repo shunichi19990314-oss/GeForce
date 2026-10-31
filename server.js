@@ -172,6 +172,7 @@ const SHIM = `(function () {
   var P = ${JSON.stringify(PREFIX)};
   var OH = ${JSON.stringify(ORIGIN_HOST)};
   var BLOCK = new RegExp(${JSON.stringify(BLOCK_RE.source)}, 'i');
+  var LKEY = '__gfnLog';
 
   function base() {
     if (window.__GFN_DOC__) return window.__GFN_DOC__;
@@ -200,6 +201,14 @@ const SHIM = `(function () {
 
   function store(k, v) { try { localStorage.setItem(k, v); } catch (e) {} }
   function load(k) { try { return localStorage.getItem(k); } catch (e) { return null; } }
+
+  function saveLog() { try { localStorage.setItem(LKEY, JSON.stringify(lines.slice(-200))); } catch (e) {} }
+  function restoreLog() {
+    try {
+      var v = JSON.parse(localStorage.getItem(LKEY) || '[]');
+      if (v && v.length) lines = v;
+    } catch (e) {}
+  }
 
   function mkBtn(label, fn) {
     var b = document.createElement('button');
@@ -272,7 +281,7 @@ const SHIM = `(function () {
     head.appendChild(mkBtn('LOGIN', runLogin));
     head.appendChild(mkBtn('CLR', runClear));
     head.appendChild(mkBtn('COPY', copyAll));
-    head.appendChild(mkBtn('CLEAR', function () { lines = []; if (list) list.textContent = ''; }));
+    head.appendChild(mkBtn('CLEAR', function () { lines = []; saveLog(); if (list) list.textContent = ''; }));
     head.appendChild(mkBtn('CLOSE', function () {
       store('gfnDebug', '0');
       box.remove();
@@ -282,12 +291,12 @@ const SHIM = `(function () {
 
     list = document.createElement('div');
     list.style.cssText = 'flex:1;overflow:auto;padding:6px 7px;white-space:pre-wrap;overflow-wrap:anywhere;user-select:text;-webkit-user-select:text';
-    list.textContent = '(まだ通信ログはありません)';
 
     box.appendChild(head);
     box.appendChild(list);
     document.documentElement.appendChild(box);
 
+    if (lines.length === 0) list.textContent = '(まだ通信ログはありません)';
     for (var i = 0; i < lines.length; i++) {
       var d = document.createElement('div');
       d.textContent = lines[i];
@@ -303,6 +312,7 @@ const SHIM = `(function () {
     if (count++ > 400) return;
     if (lines.length === 0 && list) list.textContent = '';
     lines.push(line);
+    saveLog();
     if (!box) return;
     var d = document.createElement('div');
     d.textContent = line;
@@ -323,7 +333,6 @@ const SHIM = `(function () {
     log('rej', '', (r && (r.message || r)) || 'unknown');
   });
 
-  // ---- location 差し替え（prototype のアクセサを直接書き換える）----
   try {
     var lp = window.Location && window.Location.prototype;
     if (lp) {
@@ -428,9 +437,19 @@ const SHIM = `(function () {
   else if (/[?&]debug=1/.test(location.href)) { want = '1'; store('gfnDebug', '1'); }
   if (want === null) want = '1';
 
+  function keys(o) {
+    try {
+      var a = [];
+      for (var i = 0; i < o.length; i++) a.push(o.key(i));
+      return a.join(',');
+    } catch (e) { return '?'; }
+  }
+
   function boot() {
+    restoreLog();
     if (want !== '0') overlay();
     log('init', window.__GFN_DOC__ || location.href, 'shim active');
+    log('diag', location.pathname, 'ss=[' + keys(sessionStorage) + '] ls=[' + keys(localStorage) + ']');
   }
   if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', boot);
   else boot();
