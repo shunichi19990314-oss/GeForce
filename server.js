@@ -166,6 +166,54 @@ function rewriteCss(css, base) {
     .replace(/@import\s+(['"])([^'"]+)\1/gi, (m, q, u) => `@import ${q}${mapUrl(u, base)}${q}`);
 }
 
+// OAuth 戻り先ページの置き換え（opener / sessionStorage に依存しない実装）
+const REDIRECT_HTML = `<!doctype html>
+<html lang="ja"><head><meta charset="utf-8"><title>GeForce NOW</title>
+<style>body{background:#1a1a1a;color:#ccc;font:14px system-ui,sans-serif;display:grid;place-items:center;height:100vh;margin:0}</style>
+</head><body><div>認証中...</div>
+<script>
+(function () {
+  function norm(x) {
+    try {
+      var a = new URL(x, location.href);
+      if (a.origin === location.origin) return a.pathname + a.search + a.hash;
+      return '/__p/' + a.href;
+    } catch (e) { return x; }
+  }
+  var u = new URL(location.href);
+  var oauthUrl = u.searchParams.get('oauth_url');
+  var state = u.searchParams.get('state');
+
+  if (oauthUrl && state) {
+    try { sessionStorage.setItem('oauth_nonce_session', state); } catch (e) {}
+    location.replace(norm(oauthUrl));
+    return;
+  }
+
+  var data = {};
+  u.searchParams.forEach(function (v, k) { data[k] = v; });
+
+  var ret = '/mall/#/loginwall';
+  try {
+    var raw = sessionStorage.getItem('GfnOauthUrlData');
+    if (raw) {
+      var o = JSON.parse(raw);
+      if (o && o.returnUrl) ret = norm(o.returnUrl);
+    }
+  } catch (e) {}
+  if (data.state) {
+    try {
+      var st = decodeURIComponent(data.state);
+      if (st && st.charAt(0) === '/') ret = st;
+    } catch (e) {}
+  }
+
+  try { localStorage.setItem('oauth', JSON.stringify({ data: data })); } catch (e) {}
+
+  location.replace(ret);
+})();
+</script></body></html>`;
+
 const SHIM = `(function () {
   if (window.__GFN_SHIM__) return;
   window.__GFN_SHIM__ = true;
@@ -813,6 +861,12 @@ function probeLocal(path, headers) {
   });
 }
 
+const REDIRECT_PATHS = [
+  '/redirect/starfleet-oauth-redirect.html',
+  '/redirect/starfleet-oauth-redirect-login.html',
+  '/redirect/gfn-jarvis-oauth-redirect.html',
+];
+
 const REDIR_CANDIDATES = [
   'https://play.geforcenow.com/redirect/starfleet-oauth-redirect.html',
   'https://play.geforcenow.com/redirect/starfleet-oauth-redirect-login.html',
@@ -991,6 +1045,13 @@ app.get('/__probe', async (req, res) => {
 
   res.type('application/json');
   res.send(JSON.stringify({ target: t.href, method, out }, null, 2));
+});
+
+// 自前の戻り先ページ
+app.get(REDIRECT_PATHS, (req, res) => {
+  res.type('text/html; charset=utf-8');
+  res.setHeader('cache-control', 'no-store');
+  res.send(REDIRECT_HTML);
 });
 
 async function prepare(req, target) {
