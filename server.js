@@ -323,7 +323,6 @@ const SHIM = `(function () {
     log('rej', '', (r && (r.message || r)) || 'unknown');
   });
 
-  // ---- ナビゲーションの差し替え（JS の location 遷移対策）----
   try {
     var LP = window.Location && window.Location.prototype;
     if (LP) {
@@ -690,6 +689,47 @@ function probeOnce(url, method, body, headers) {
   });
 }
 
+function fetchText(url, limit) {
+  return new Promise((resolve) => {
+    let u;
+    try {
+      u = new URL(url);
+    } catch {
+      return resolve({ error: 'bad url' });
+    }
+    const r = https.request(
+      {
+        hostname: u.hostname,
+        path: u.pathname + u.search,
+        method: 'GET',
+        timeout: 20000,
+        headers: { 'user-agent': UA, accept: '*/*', 'accept-language': 'ja,en;q=0.8' },
+      },
+      (resp) => {
+        const chunks = [];
+        resp.on('data', (c) => chunks.push(c));
+        resp.on('end', () => {
+          let b = Buffer.concat(chunks);
+          try {
+            b = decodeBody(b, resp.headers['content-encoding']);
+          } catch {}
+          resolve({
+            status: resp.statusCode,
+            ct: resp.headers['content-type'],
+            body: b.toString('utf8').slice(0, limit || 8000),
+          });
+        });
+      }
+    );
+    r.on('error', (e) => resolve({ error: e.message }));
+    r.on('timeout', () => {
+      r.destroy();
+      resolve({ error: 'timeout' });
+    });
+    r.end();
+  });
+}
+
 function probeH2(url, method, body, headers) {
   return new Promise((resolve) => {
     let u;
@@ -839,6 +879,16 @@ app.get('/__shim.js', (req, res) => {
   res.type('application/javascript; charset=utf-8');
   res.setHeader('cache-control', 'no-cache');
   res.send(SHIM);
+});
+
+// 任意URLの中身をそのまま見る
+app.get('/__get', async (req, res) => {
+  const selfHost = String(req.headers.host || '').toLowerCase();
+  const t = normalizeTarget(String(req.query.u || ''), selfHost);
+  if (!t) return res.status(400).type('text/plain').send('bad u');
+  const p = await fetchText(t.href, Number(req.query.n || 8000));
+  res.type('text/plain; charset=utf-8');
+  res.send('STATUS ' + p.status + '  CT ' + p.ct + '\n\n' + (p.body || p.error || ''));
 });
 
 app.get('/__clearcookies', (req, res) => {
