@@ -352,6 +352,15 @@ const SHIM = `(function () {
     });
   } catch (e) {}
 
+  // 第2引数（_self など）を落とすとタブ文脈が切れる
+  var oo = window.open;
+  window.open = function () {
+    var a = [].slice.call(arguments);
+    if (a.length && a[0]) a[0] = map(a[0]);
+    log('open', a[0], a[1] || '');
+    return oo.apply(window, a);
+  };
+
   var of = window.fetch;
   window.fetch = function (input, init) {
     var target = typeof input === 'string' || input instanceof URL ? String(input) : (input && input.url);
@@ -417,9 +426,6 @@ const SHIM = `(function () {
     WK.prototype = OW.prototype;
     window.Worker = WK;
   }
-
-  var oo = window.open;
-  window.open = function (u) { return oo.call(window, u ? map(u) : u); };
 
   if (navigator.sendBeacon) {
     var ob = navigator.sendBeacon.bind(navigator);
@@ -881,7 +887,6 @@ app.get('/__shim.js', (req, res) => {
   res.send(SHIM);
 });
 
-// 任意URLの中身をそのまま見る
 app.get('/__get', async (req, res) => {
   const selfHost = String(req.headers.host || '').toLowerCase();
   const t = normalizeTarget(String(req.query.u || ''), selfHost);
