@@ -18,7 +18,6 @@ const REDIRECT_PATHS = [
 ];
 
 const BLOCK = /(^|\.)(doubleclick\.net|googletagmanager\.com|google-analytics\.com)$/i;
-const AUTH_RE = /(^|\.)(accounts\.nvgs\.nvidia\.com|login\.nvidia\.com|login\.nvgs\.nvidia\.com)$/i;
 
 const SKIP_PREFIX = ['data:', 'blob:', 'javascript:', 'mailto:', 'about:', 'tel:', 'chrome-extension:'];
 
@@ -47,7 +46,9 @@ function mapUrl(u, base) {
   if (s.startsWith('#')) return u;
 
   let abs;
+  let baseOrigin = null;
   try {
+    baseOrigin = new URL(base).origin;
     abs = new URL(s, base);
   } catch {
     return u;
@@ -55,8 +56,7 @@ function mapUrl(u, base) {
   if (abs.protocol !== 'https:') return u;
   if (BLOCK.test(abs.hostname)) return u;
 
-  // すでにプロキシ経由のパスならそのまま
-  if (abs.origin === base && abs.pathname.startsWith(PREFIX)) {
+  if (abs.origin === baseOrigin && abs.pathname.startsWith(PREFIX)) {
     return abs.pathname + abs.search + abs.hash;
   }
   return PREFIX + abs.href;
@@ -176,7 +176,6 @@ function rewriteHtml(html, docUrl, req) {
     if (v) $(el).attr('content', mapUrl(v, effBase));
   });
 
-  // redirect_uri の補正（プロキシ自身のホストを指している場合のみ）
   $('script').each((_, el) => {
     const s = $(el).html();
     if (s && s.indexOf('redirect_uri') >= 0) $(el).html(fixRedirectUri(s, selfHost));
@@ -202,7 +201,6 @@ const SHIM = String.raw`(function () {
   var AUTH = /(^|\.)(accounts\.nvgs\.nvidia\.com|login\.nvidia\.com|login\.nvgs\.nvidia\.com)$/i;
   var WATCH = /(^|\.)(accounts\.nvgs\.nvidia\.com|login\.nvidia\.com|login\.nvgs\.nvidia\.com|play\.geforcenow\.com|pcs\.geforcenow\.com)$/i;
 
-  /* ---- ログ ---- */
   var ON = localStorage.getItem('gfnDebug') !== '0';
   var lines = [];
   try { lines = JSON.parse(localStorage.getItem('gfnLog') || '[]'); } catch (e) { lines = []; }
@@ -219,6 +217,7 @@ const SHIM = String.raw`(function () {
       t.textContent = 'GFN LOG';
       t.style.flex = '1';
       head.appendChild(t);
+      var cp;
       var mk = function (label, fn) {
         var b = document.createElement('button');
         b.textContent = label;
@@ -227,16 +226,7 @@ const SHIM = String.raw`(function () {
         head.appendChild(b);
         return b;
       };
-      var cp = mk('COPY', copyAll);
-      mk('CLEAR', function () { lines = []; localStorage.setItem('gfnLog', '[]'); if (bodyEl) bodyEl.textContent = ''; });
-      mk('CLOSE', function () { box.remove(); box = null; });
-      bodyEl = document.createElement('div');
-      bodyEl.style.cssText = 'overflow:auto;padding:5px 6px;white-space:pre-wrap;overflow-wrap:anywhere;user-select:text';
-      box.appendChild(head);
-      box.appendChild(bodyEl);
-      document.body.appendChild(box);
-
-      function copyAll() {
+      var copyAll = function () {
         var text = lines.join('\n');
         var done = function (ok) { cp.textContent = ok ? 'COPIED' : 'FAIL'; setTimeout(function () { cp.textContent = 'COPY'; }, 1200); };
         var fb = function () {
@@ -254,7 +244,15 @@ const SHIM = String.raw`(function () {
         if (navigator.clipboard && navigator.clipboard.writeText) {
           navigator.clipboard.writeText(text).then(function () { done(true); }, function () { done(fb()); });
         } else done(fb());
-      }
+      };
+      cp = mk('COPY', copyAll);
+      mk('CLEAR', function () { lines = []; try { localStorage.setItem('gfnLog', '[]'); } catch (e) {} if (bodyEl) bodyEl.textContent = ''; });
+      mk('CLOSE', function () { box.remove(); box = null; });
+      bodyEl = document.createElement('div');
+      bodyEl.style.cssText = 'overflow:auto;padding:5px 6px;white-space:pre-wrap;overflow-wrap:anywhere;user-select:text';
+      box.appendChild(head);
+      box.appendChild(bodyEl);
+      document.body.appendChild(box);
     }
     bodyEl.textContent = lines.join('\n');
     bodyEl.scrollTop = bodyEl.scrollHeight;
@@ -272,7 +270,6 @@ const SHIM = String.raw`(function () {
   if (document.body) paint();
   else document.addEventListener('DOMContentLoaded', paint);
 
-  /* ---- URL 正規化 ---- */
   function norm(x) {
     try {
       var a = new URL(String(x), document.baseURI || location.href);
@@ -284,20 +281,18 @@ const SHIM = String.raw`(function () {
   function hostOf(x) {
     try { return new URL(String(x), location.href).hostname; } catch (e) { return ''; }
   }
-  function watch(x) { return AUTH.test(hostOf(x)); }
+  function watch(x) { return WATCH.test(hostOf(x)); }
 
-  /* ---- レスポンス観察 ---- */
   function observe(label, url, status, headers, body) {
     if (!watch(url)) return;
     var loc = '';
     try { loc = (headers && headers.get && headers.get('location')) || ''; } catch (e) {}
     var head = '[' + label + '] ' + status + ' ' + String(url).slice(0, 160);
-    if (loc) head += ' LOC=' + String(loc).slice(0, 200);
+    if (loc) head += ' LOC=' + String(loc).slice(0, 220);
     if (body) head += ' BODY=' + String(body).slice(0, 300).replace(/\s+/g, ' ');
     log(head);
   }
 
-  /* ---- fetch ---- */
   var of = window.fetch;
   if (of) {
     window.fetch = function (input, init) {
@@ -325,7 +320,6 @@ const SHIM = String.raw`(function () {
     };
   }
 
-  /* ---- XHR ---- */
   var xo = XMLHttpRequest.prototype.open;
   var xs = XMLHttpRequest.prototype.send;
   XMLHttpRequest.prototype.open = function (m, u) {
@@ -341,7 +335,6 @@ const SHIM = String.raw`(function () {
     this.addEventListener('loadend', function () {
       var st = 0;
       try { st = self.status; } catch (e) {}
-      if (st >= 400 && watch(self.__u)) log('[xhr] ' + st + ' ' + String(self.__u).slice(0, 160));
       if (watch(self.__u)) {
         var b = '';
         try { if (self.responseType === '' || self.responseType === 'text') b = (self.responseText || '').slice(0, 300); } catch (e) {}
@@ -351,7 +344,6 @@ const SHIM = String.raw`(function () {
     return xs.apply(this, arguments);
   };
 
-  /* ---- WebSocket ---- */
   var OW = window.WebSocket;
   if (OW) {
     window.WebSocket = function (u, p) {
@@ -362,7 +354,6 @@ const SHIM = String.raw`(function () {
     window.WebSocket.prototype = OW.prototype;
   }
 
-  /* ---- window.open ---- */
   var oo = window.open;
   window.open = function (u) {
     var a = Array.prototype.slice.call(arguments);
@@ -370,7 +361,6 @@ const SHIM = String.raw`(function () {
     return oo.apply(window, a);
   };
 
-  /* ---- Location ---- */
   var d = Object.getOwnPropertyDescriptor(Location.prototype, 'href');
   if (d && d.set) {
     Object.defineProperty(Location.prototype, 'href', {
@@ -394,7 +384,6 @@ const SHIM = String.raw`(function () {
     };
   });
 
-  /* window.location = url 形式（href セッターを通らない） */
   try {
     var loc = window.location;
     Object.defineProperty(window, 'location', {
@@ -403,12 +392,11 @@ const SHIM = String.raw`(function () {
       set: function (v) {
         var t = norm(v);
         log('nav(loc) ' + String(v).slice(0, 160));
-        d && d.set ? d.set.call(loc, t) : (loc.href = t);
+        if (d && d.set) d.set.call(loc, t); else loc.href = t;
       },
     });
   } catch (e) {}
 
-  /* ---- form / a ---- */
   var fsub = HTMLFormElement.prototype.submit;
   HTMLFormElement.prototype.submit = function () {
     try { if (this.action) this.action = norm(this.action); } catch (e) {}
@@ -429,10 +417,10 @@ const SHIM = String.raw`(function () {
     location.href = h;
   }, true);
 
-  /* ---- 認証情報の後始末 ---- */
   try {
     var q = new URL(location.href);
-    if (/\/loginwall/.test(q.hash) && q.searchParams.get('code')) log('code=' + q.searchParams.get('code').slice(0, 12) + '...');
+    var code = q.searchParams.get('code');
+    if (code) log('code=' + code.slice(0, 10) + '... state=' + String(q.searchParams.get('state') || '').slice(0, 10));
   } catch (e) {}
 })();`;
 
@@ -596,7 +584,9 @@ function proxyFor(origin) {
       ]) delete h[k];
 
       if (h.location) h.location = mapLocation(h.location, target);
-      if (h['set-cookie']) h['set-cookie'] = h['set-cookie'].map(fixCookie(host));
+      if (h['set-cookie']) {
+        h['set-cookie'] = (Array.isArray(h['set-cookie']) ? h['set-cookie'] : [h['set-cookie']]).map(fixCookie(host));
+      }
       if (h['access-control-allow-origin']) h['access-control-allow-origin'] = req.headers.origin || '*';
 
       const ct = String(h['content-type'] || '').toLowerCase();
@@ -619,21 +609,27 @@ function proxyFor(origin) {
         let buf = Buffer.concat(chunks);
         let headers = h;
 
-        // stringtable 404 の救済
         if (status === 404 && /\/api\/1\/stringtable\//.test(target)) {
           const alt = await refetchStringtable(target, req);
           if (alt && alt.status === 200) {
             status = alt.status;
             buf = alt.body;
             headers = Object.assign({}, h, alt.headers);
-            for (const k of ['content-security-policy', 'strict-transport-security', 'alt-svc', 'set-cookie']) delete headers[k];
+            for (const k of [
+              'content-security-policy',
+              'strict-transport-security',
+              'alt-svc',
+              'set-cookie',
+              'content-encoding',
+              'transfer-encoding',
+            ]) delete headers[k];
           }
         }
 
         let body = decodeBody(buf, enc);
         if (isHtml) body = rewriteHtml(body, target, req);
         else if (isCss) body = rewriteCss(body, target);
-        else if (/redirect_uri=/.test(body)) body = fixRedirectUri(body, selfHostOf(req));
+        else if (body.indexOf('redirect_uri=') >= 0) body = fixRedirectUri(body, selfHostOf(req));
 
         const out = Buffer.from(body, 'utf8');
         delete headers['content-encoding'];
@@ -687,7 +683,10 @@ app.get('/__shim.js', (req, res) => {
 app.get('/__diag', (req, res) => {
   res.type('text/plain; charset=utf-8');
   res.setHeader('cache-control', 'no-store');
-  const cookies = String(req.headers.cookie || '').split(';').map((c) => c.trim().split('=')[0]).filter(Boolean);
+  const cookies = String(req.headers.cookie || '')
+    .split(';')
+    .map((c) => c.trim().split('=')[0])
+    .filter(Boolean);
   res.send('host=' + selfHostOf(req) + '\ncookies=' + JSON.stringify(cookies));
 });
 
@@ -697,21 +696,35 @@ app.get('/__clearcookies', (req, res) => {
   for (const c of list) {
     const name = c.split('=')[0].trim();
     if (!name) continue;
-    out.push(`${name}=; Path=/; Max-Age=0`);
-    out.push(`${name}=; Path=${PREFIX}; Max-Age=0`);
+    out.push(name + '=; Path=/; Max-Age=0');
+    out.push(name + '=; Path=' + PREFIX + '; Max-Age=0');
   }
   res.setHeader('set-cookie', out);
   res.type('text/plain').send('cleared ' + out.length);
 });
 
-// サーバ側プローブ（ブラウザから叩ける）
 app.get('/__probe', async (req, res) => {
   const url = String(req.query.url || '');
   if (!url) return res.status(400).type('text/plain').send('url required');
   const variants = [
     { name: 'plain', headers: {} },
-    { name: 'browser', headers: { 'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36', accept: 'application/json, text/plain, */*', 'accept-language': 'ja-JP,ja;q=0.9' },
-    { name: 'referer', headers: { referer: 'https://accounts.nvgs.nvidia.com/', origin: 'https://accounts.nvgs.nvidia.com', accept: 'application/json' } },
+    {
+      name: 'browser',
+      headers: {
+        'user-agent':
+          'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+        accept: 'application/json, text/plain, */*',
+        'accept-language': 'ja-JP,ja;q=0.9',
+      },
+    },
+    {
+      name: 'referer',
+      headers: {
+        referer: 'https://accounts.nvgs.nvidia.com/',
+        origin: 'https://accounts.nvgs.nvidia.com',
+        accept: 'application/json',
+      },
+    },
   ];
   const out = {};
   await Promise.all(
@@ -731,7 +744,12 @@ app.get('/__probe', async (req, res) => {
               const c = [];
               pr.on('data', (d) => c.push(d));
               pr.on('end', () => {
-                out[v.name] = pr.statusCode + ' ' + String(pr.headers['content-type'] || '') + ' :: ' + Buffer.concat(c).toString('utf8').slice(0, 200);
+                out[v.name] =
+                  pr.statusCode +
+                  ' ' +
+                  String(pr.headers['content-type'] || '') +
+                  ' :: ' +
+                  Buffer.concat(c).toString('utf8').slice(0, 200);
                 resolve();
               });
             }
@@ -772,7 +790,9 @@ app.get('/__get', async (req, res) => {
         const c = [];
         pr.on('data', (d) => c.push(d));
         pr.on('end', () => {
-          res.type('text/plain; charset=utf-8').send('STATUS ' + pr.statusCode + '\n\n' + Buffer.concat(c).toString('utf8'));
+          res
+            .type('text/plain; charset=utf-8')
+            .send('STATUS ' + pr.statusCode + '\n\n' + Buffer.concat(c).toString('utf8'));
         });
       }
     );
@@ -787,14 +807,12 @@ app.get('/__get', async (req, res) => {
   }
 });
 
-// OAuth 戻り先
 app.get(REDIRECT_PATHS, (req, res) => {
   res.type('text/html; charset=utf-8');
   res.setHeader('cache-control', 'no-store');
   res.send(REDIRECT_HTML);
 });
 
-// 任意ホスト
 app.use(PREFIX, (req, res, next) => {
   const raw = req.originalUrl.slice(PREFIX.length);
   let target;
@@ -810,7 +828,6 @@ app.use(PREFIX, (req, res, next) => {
   return proxyFor(target.origin)(req, res, next);
 });
 
-// 本体
 app.use((req, res, next) => {
   req.__target = ORIGIN + req.originalUrl;
   req.__path = req.originalUrl;
