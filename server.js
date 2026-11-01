@@ -22,13 +22,14 @@ const REDIRECT_PATHS = [
 const BLOCK = /(^|\.)(doubleclick\.net|googletagmanager\.com|google-analytics\.com)$/i;
 const SKIP_PREFIX = ['data:', 'blob:', 'javascript:', 'mailto:', 'about:', 'tel:', 'chrome-extension:'];
 const AUTH_RE = /(^|\.)(accounts\.nvgs\.nvidia\.com|login\.nvidia\.com|login\.nvgs\.nvidia\.com)$/i;
+const CLEAR_HOSTS = ['accounts.nvgs.nvidia.com', 'login.nvgs.nvidia.com', 'login.nvidia.com', 'play.geforcenow.com'];
 
 let SELF_HOST = '';
 const srvLog = [];
 
 function srv(s) {
   srvLog.push(new Date().toISOString().slice(11, 19) + ' ' + s);
-  if (srvLog.length > 200) srvLog.shift();
+  if (srvLog.length > 400) srvLog.shift();
 }
 
 function b64u(s) {
@@ -176,6 +177,24 @@ function fixRedirectUri(str, selfHost) {
     }
     return m;
   });
+}
+
+/* MainAuth_N を新しい順に並べ替える */
+function reorderCookie(header) {
+  const parts = String(header || '')
+    .split(';')
+    .map((c) => c.trim())
+    .filter(Boolean);
+  const rank = (c) => {
+    const n = c.split('=')[0];
+    const m = n.match(/_(\d+)$/);
+    return m ? Number(m[1]) : 0;
+  };
+  return parts
+    .map((c, i) => ({ c, i, r: rank(c) }))
+    .sort((a, b) => b.r - a.r || a.i - b.i)
+    .map((o) => o.c)
+    .join('; ');
 }
 
 /* ---------------- HTML / CSS 書き換え ---------------- */
@@ -680,7 +699,10 @@ function proxyFor(origin) {
           refOrigin = new URL(ref).origin;
           proxyReq.setHeader('referer', ref);
           proxyReq.setHeader('origin', refOrigin);
-          proxyReq.setHeader('sec-fetch-site', siteOf(new URL(ref).hostname) === siteOf(t.hostname) ? 'same-site' : 'cross-site');
+          proxyReq.setHeader(
+            'sec-fetch-site',
+            siteOf(new URL(ref).hostname) === siteOf(t.hostname) ? 'same-site' : 'cross-site'
+          );
         } catch {
           ref = null;
         }
@@ -691,6 +713,13 @@ function proxyFor(origin) {
         proxyReq.setHeader('origin', t.origin);
       }
       req.__refOrigin = refOrigin;
+
+      if (AUTH_RE.test(t.hostname) && req.headers.cookie) {
+        const re = reorderCookie(req.headers.cookie);
+        try {
+          proxyReq.setHeader('cookie', re);
+        } catch {}
+      }
 
       try {
         proxyReq.removeHeader('if-none-match');
@@ -703,11 +732,11 @@ function proxyFor(origin) {
           .map((c) => c.trim().split('=')[0])
           .filter(Boolean);
         srv(
-          '[req] ' + req.method + ' ' + t.hostname + t.pathname +
+          '[req] ' + req.method + ' ' + t.hostname + t.pathname + (t.search || '') +
             ' o=' + refOrigin +
             ' r=' + String(ref || '-').slice(0, 90) +
-            ' sfs=' + (proxyReq.getHeader('sec-fetch-site') || '-') +
-            ' ck=' + JSON.stringify(names)
+            ' ck=' + JSON.stringify(names) +
+            ' hdr=' + JSON.stringify(Object.keys(req.headers).filter((k) => /^x-|^sec-fetch-mode|^accept$/.test(k)))
         );
       }
     },
@@ -866,6 +895,29 @@ app.get('/__diag', (req, res) => {
   res.send('host=' + SELF_HOST + '\ncookies=' + JSON.stringify(cookies));
 });
 
+/* 全 Cookie 削除ページ（各ホストのパス宛に fetch して削除させる） */
+app.get('/__clear', (req, res) => {
+  const urls = CLEAR_HOSTS.map((h) => PREFIX + chainOf(h).join('/') + MARK + '/__clear');
+  res.type('text/html; charset=utf-8');
+  res.setHeader('cache-control', 'no-store');
+  res.send(`<!doctype html><meta charset="utf-8"><title>clear</title>
+<style>body{font:13px system-ui;background:#111;color:#ccc;padding:16px}</style>
+<pre id="o">clearing...</pre>
+<script>
+var urls = ${JSON.stringify(urls)};
+var out = [];
+(async function () {
+  for (var i = 0; i < urls.length; i++) {
+    try {
+      var r = await fetch(urls[i], { cache: 'no-store' });
+      out.push(urls[i].split('/~')[0].split('/').pop() + ': ' + (await r.text()));
+    } catch (e) { out.push(urls[i] + ': ERR ' + e.message); }
+  }
+  document.getElementById('o').textContent = out.join('\\n');
+})();
+</script>`);
+});
+
 app.get('/__clearcookies', (req, res) => {
   const names = String(req.headers.cookie || '')
     .split(';')
@@ -997,6 +1049,21 @@ app.use(PREFIX, (req, res, next) => {
   } catch {
     return res.status(400).type('text/plain').send('Bad URL');
   }
+
+  // パス内の削除エンドポイント（そのホストの Cookie が載ってくる）
+  if (target.pathname === '/__clear') {
+    const mi = req.originalUrl.indexOf(MARK);
+    const base = mi >= 0 ? req.originalUrl.slice(0, mi + MARK.length) + '/' : PREFIX;
+    const names = String(req.headers.cookie || '')
+      .split(';')
+      .map((c) => c.split('=')[0].trim())
+      .filter(Boolean);
+    const out = [];
+    for (const n of names) out.push(n + '=; Path=' + base + '; Max-Age=0');
+    res.setHeader('set-cookie', out);
+    return res.type('text/plain').send('[' + names.join(',') + ']');
+  }
+
   if (!isAllowed(target.href)) return res.status(403).type('text/plain').send('Host not allowed');
   req.__target = target.href;
   req.__path = target.pathname + target.search;
