@@ -27,7 +27,7 @@ const srvLog = [];
 
 function srv(s) {
   srvLog.push(new Date().toISOString().slice(11, 19) + ' ' + s);
-  if (srvLog.length > 120) srvLog.shift();
+  if (srvLog.length > 200) srvLog.shift();
 }
 
 function b64u(s) {
@@ -51,12 +51,16 @@ function isAllowed(abs) {
   }
 }
 
-/* ドメイン階層チェーン（com / nvidia.com / nvgs.nvidia.com / ホスト） */
 function chainOf(host) {
   const labels = String(host).toLowerCase().split('.').filter(Boolean);
   const out = [];
   for (let k = 1; k <= labels.length; k++) out.push(b64u(labels.slice(labels.length - k).join('.')));
   return out;
+}
+
+function siteOf(host) {
+  const l = String(host).toLowerCase().split('.').filter(Boolean);
+  return l.slice(-2).join('.');
 }
 
 function proxyUrl(absUrl) {
@@ -87,6 +91,18 @@ function parseProxyPath(originalUrl) {
   }
   if (tail.charAt(0) !== '/') tail = '/' + tail;
   return new URL('https://' + host + tail + search);
+}
+
+/* ブラウザが送ってきた Referer（プロキシURL）を実URLへ戻す */
+function realUrlFromProxy(u) {
+  if (!u) return null;
+  try {
+    const p = new URL(u);
+    if (!p.pathname.startsWith(PREFIX)) return u;
+    return parseProxyPath(p.pathname + p.search).href;
+  } catch {
+    return null;
+  }
 }
 
 /* ---------------- URL 変換 ---------------- */
@@ -644,18 +660,40 @@ function proxyFor(origin) {
       }
       proxyReq.setHeader('accept-encoding', 'identity');
       if (!proxyReq.getHeader('accept-language')) proxyReq.setHeader('accept-language', 'ja-JP,ja;q=0.9');
-      proxyReq.setHeader('origin', t.origin);
-      proxyReq.setHeader('referer', t.href);
+
+      // 参照元を実URLに戻し、Origin / Sec-Fetch-Site をそれに合わせる
+      const ref = realUrlFromProxy(req.headers.referer);
+      if (ref) {
+        proxyReq.setHeader('referer', ref);
+        try {
+          const rHost = new URL(ref).hostname;
+          proxyReq.setHeader('origin', new URL(ref).origin);
+          proxyReq.setHeader('sec-fetch-site', siteOf(rHost) === siteOf(t.hostname) ? 'same-site' : 'cross-site');
+        } catch {
+          /* keep */
+        }
+      } else {
+        proxyReq.setHeader('referer', t.href);
+        proxyReq.setHeader('origin', t.origin);
+      }
+
       try {
         proxyReq.removeHeader('if-none-match');
         proxyReq.removeHeader('if-modified-since');
       } catch {}
+
       if (AUTH_RE.test(t.hostname)) {
         const names = String(req.headers.cookie || '')
           .split(';')
           .map((c) => c.trim().split('=')[0])
           .filter(Boolean);
-        srv('[req] ' + req.method + ' ' + t.hostname + t.pathname + ' cookies=' + JSON.stringify(names));
+        srv(
+          '[req] ' + req.method + ' ' + t.hostname + t.pathname +
+            ' o=' + (req.headers.origin || '-') +
+            ' r=' + String(req.headers.referer || '-').slice(-70) +
+            ' sfs=' + (req.headers['sec-fetch-site'] || '-') +
+            ' ck=' + JSON.stringify(names)
+        );
       }
     },
 
@@ -684,8 +722,19 @@ function proxyFor(origin) {
       if (h.location) h.location = mapLocation(h.location, target);
       if (h['set-cookie']) {
         const arr = Array.isArray(h['set-cookie']) ? h['set-cookie'] : [h['set-cookie']];
+        if (AUTH_RE.test(host)) {
+          srv(
+            '[set] ' + host + ' :: ' +
+              arr
+                .map((c) => {
+                  const parts = String(c).split(';');
+                  const attrs = parts.slice(1).map((s) => s.trim().split('=')[0]).join(',');
+                  return parts[0].split('=')[0] + '{' + attrs + '}';
+                })
+                .join(' | ')
+          );
+        }
         h['set-cookie'] = arr.map(fixCookie(host));
-        if (AUTH_RE.test(host)) srv('[set] ' + host + ' ' + arr.length + ' cookie(s)');
       }
       if (h['access-control-allow-origin']) h['access-control-allow-origin'] = req.headers.origin || '*';
 
