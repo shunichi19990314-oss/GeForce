@@ -18,8 +18,22 @@ const REDIRECT_PATHS = [
 ];
 
 const BLOCK = /(^|\.)(doubleclick\.net|googletagmanager\.com|google-analytics\.com)$/i;
-
 const SKIP_PREFIX = ['data:', 'blob:', 'javascript:', 'mailto:', 'about:', 'tel:', 'chrome-extension:'];
+
+let SELF_HOST = '';
+
+/* ---------------- エンコード ---------------- */
+
+function b64u(s) {
+  return Buffer.from(s, 'utf8').toString('base64url');
+}
+function unb64u(s) {
+  try {
+    return Buffer.from(s, 'base64url').toString('utf8');
+  } catch {
+    return '';
+  }
+}
 
 function isAllowed(abs) {
   try {
@@ -31,8 +45,34 @@ function isAllowed(abs) {
   }
 }
 
-function selfHostOf(req) {
-  return String(req.headers.host || '').toLowerCase();
+function proxyUrl(absUrl) {
+  const u = new URL(absUrl);
+  return PREFIX + b64u(u.hostname) + '/' + b64u(u.pathname + u.search) + u.hash;
+}
+
+function cookiePathFor(host) {
+  return PREFIX + b64u(host) + '/';
+}
+
+function parseProxyPath(originalUrl) {
+  const rest = originalUrl.slice(PREFIX.length);
+  const qi = rest.indexOf('?');
+  const seg = qi < 0 ? rest : rest.slice(0, qi);
+  const extra = qi < 0 ? '' : rest.slice(qi);
+
+  // 旧形式 /__p/https://host/path
+  if (/^https?:\/\//i.test(seg)) {
+    return new URL(seg + extra);
+  }
+
+  const slash = seg.indexOf('/');
+  const hostSeg = slash < 0 ? seg : seg.slice(0, slash);
+  const pathSeg = slash < 0 ? '' : seg.slice(slash + 1);
+  const host = unb64u(hostSeg);
+  if (!host) throw new Error('bad host');
+  let path = unb64u(pathSeg) || '/';
+  if (path.charAt(0) !== '/') path = '/' + path;
+  return new URL('https://' + host + path + extra);
 }
 
 /* ---------------- URL 変換 ---------------- */
@@ -43,30 +83,26 @@ function mapUrl(u, base) {
   if (!s) return u;
   const low = s.toLowerCase();
   for (const p of SKIP_PREFIX) if (low.startsWith(p)) return u;
-  if (s.startsWith('#')) return u;
+  if (s.charAt(0) === '#') return u;
 
   let abs;
-  let baseOrigin = null;
   try {
-    baseOrigin = new URL(base).origin;
     abs = new URL(s, base);
   } catch {
     return u;
   }
   if (abs.protocol !== 'https:') return u;
   if (BLOCK.test(abs.hostname)) return u;
+  if (SELF_HOST && abs.hostname === SELF_HOST) return abs.pathname + abs.search + abs.hash;
 
-  if (abs.origin === baseOrigin && abs.pathname.startsWith(PREFIX)) {
-    return abs.pathname + abs.search + abs.hash;
-  }
-  return PREFIX + abs.href;
+  return proxyUrl(abs.href);
 }
 
 function mapLocation(loc, target) {
   try {
     const abs = new URL(loc, target);
     if (abs.protocol !== 'https:') return loc;
-    return PREFIX + abs.href;
+    return proxyUrl(abs.href);
   } catch {
     return loc;
   }
@@ -77,7 +113,7 @@ function fixCookie(host) {
     String(c)
       .replace(/;\s*domain=[^;]*/gi, '')
       .replace(/;\s*path=[^;]*/gi, '')
-      .replace(/;\s*partitioned/gi, '') + '; Path=' + PREFIX + 'https://' + host + '/';
+      .replace(/;\s*partitioned/gi, '') + '; Path=' + cookiePathFor(host);
 }
 
 function fixRedirectUri(str, selfHost) {
@@ -91,7 +127,7 @@ function fixRedirectUri(str, selfHost) {
     }
     try {
       const u = new URL(d);
-      if (u.host.toLowerCase() === selfHost) {
+      if (u.hostname.toLowerCase() === selfHost) {
         return p + encodeURIComponent(ORIGIN + REDIRECT_PATH);
       }
     } catch {
@@ -112,7 +148,6 @@ function rewriteCss(css, base) {
 }
 
 function rewriteHtml(html, docUrl, req) {
-  const selfHost = selfHostOf(req);
   const $ = cheerio.load(html, { decodeEntities: false });
 
   let effBase = docUrl;
@@ -178,11 +213,11 @@ function rewriteHtml(html, docUrl, req) {
 
   $('script').each((_, el) => {
     const s = $(el).html();
-    if (s && s.indexOf('redirect_uri') >= 0) $(el).html(fixRedirectUri(s, selfHost));
+    if (s && s.indexOf('redirect_uri') >= 0) $(el).html(fixRedirectUri(s, SELF_HOST));
   });
 
   $('head').prepend(
-    `<script>window.__GFN_DOC__=${JSON.stringify(docUrl)};window.__GFN_SELF__=${JSON.stringify(selfHost)};</script>` +
+    `<script>window.__GFN_DOC__=${JSON.stringify(docUrl)};window.__GFN_SELF__=${JSON.stringify(SELF_HOST)};</script>` +
       '<script src="/__shim.js"></script>'
   );
 
@@ -196,10 +231,13 @@ const SHIM = String.raw`(function () {
   window.__GFN_PROXY_SHIM__ = true;
 
   var P = '/__p/';
-  var DOC = window.__GFN_DOC__ || location.href;
-  var SELF = window.__GFN_SELF__ || location.host;
   var AUTH = /(^|\.)(accounts\.nvgs\.nvidia\.com|login\.nvidia\.com|login\.nvgs\.nvidia\.com)$/i;
   var WATCH = /(^|\.)(accounts\.nvgs\.nvidia\.com|login\.nvidia\.com|login\.nvgs\.nvidia\.com|play\.geforcenow\.com|pcs\.geforcenow\.com)$/i;
+
+  function b64u(s) {
+    try { return btoa(unescape(encodeURIComponent(s))).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, ''); }
+    catch (e) { return ''; }
+  }
 
   var ON = localStorage.getItem('gfnDebug') !== '0';
   var lines = [];
@@ -274,8 +312,8 @@ const SHIM = String.raw`(function () {
     try {
       var a = new URL(String(x), document.baseURI || location.href);
       if (a.origin === location.origin) return a.pathname + a.search + a.hash;
-      if (a.protocol === 'https:') return P + a.href;
-      return a.href;
+      if (a.protocol !== 'https:') return a.href;
+      return P + b64u(a.hostname) + '/' + b64u(a.pathname + a.search) + a.hash;
     } catch (e) { return x; }
   }
   function hostOf(x) {
@@ -416,12 +454,6 @@ const SHIM = String.raw`(function () {
     ev.preventDefault();
     location.href = h;
   }, true);
-
-  try {
-    var q = new URL(location.href);
-    var code = q.searchParams.get('code');
-    if (code) log('code=' + code.slice(0, 10) + '... state=' + String(q.searchParams.get('state') || '').slice(0, 10));
-  } catch (e) {}
 })();`;
 
 /* ---------------- 戻り先ページ ---------------- */
@@ -432,11 +464,15 @@ const REDIRECT_HTML = `<!doctype html>
 </head><body><div>認証中...</div>
 <script>
 (function () {
+  function b64u(s) {
+    try { return btoa(unescape(encodeURIComponent(s))).replace(/\\+/g, '-').replace(/\\//g, '_').replace(/=+$/, ''); }
+    catch (e) { return ''; }
+  }
   function norm(x) {
     try {
       var a = new URL(x, location.href);
       if (a.origin === location.origin) return a.pathname + a.search + a.hash;
-      return '/__p/' + a.href;
+      return '/__p/' + b64u(a.hostname) + '/' + b64u(a.pathname + a.search) + a.hash;
     } catch (e) { return x; }
   }
   var u = new URL(location.href);
@@ -467,9 +503,7 @@ const REDIRECT_HTML = `<!doctype html>
     } catch (e) {}
   }
 
-  try {
-    localStorage.setItem('oauth', JSON.stringify({ data: data, t: Date.now() }));
-  } catch (e) {}
+  try { localStorage.setItem('oauth', JSON.stringify({ data: data, t: Date.now() })); } catch (e) {}
   try {
     if (window.opener && !window.opener.closed) {
       window.opener.postMessage({ type: 'gfn-oauth', data: data }, '*');
@@ -629,7 +663,7 @@ function proxyFor(origin) {
         let body = decodeBody(buf, enc);
         if (isHtml) body = rewriteHtml(body, target, req);
         else if (isCss) body = rewriteCss(body, target);
-        else if (body.indexOf('redirect_uri=') >= 0) body = fixRedirectUri(body, selfHostOf(req));
+        else if (body.indexOf('redirect_uri=') >= 0) body = fixRedirectUri(body, SELF_HOST);
 
         const out = Buffer.from(body, 'utf8');
         delete headers['content-encoding'];
@@ -662,6 +696,11 @@ const app = express();
 app.disable('x-powered-by');
 app.set('trust proxy', true);
 
+app.use((req, res, next) => {
+  SELF_HOST = String(req.headers.host || '').toLowerCase();
+  next();
+});
+
 if (process.env.BASIC_USER && process.env.BASIC_PASS) {
   app.use((req, res, next) => {
     const auth = req.headers.authorization || '';
@@ -687,7 +726,7 @@ app.get('/__diag', (req, res) => {
     .split(';')
     .map((c) => c.trim().split('=')[0])
     .filter(Boolean);
-  res.send('host=' + selfHostOf(req) + '\ncookies=' + JSON.stringify(cookies));
+  res.send('host=' + SELF_HOST + '\ncookies=' + JSON.stringify(cookies));
 });
 
 app.get('/__clearcookies', (req, res) => {
@@ -814,10 +853,9 @@ app.get(REDIRECT_PATHS, (req, res) => {
 });
 
 app.use(PREFIX, (req, res, next) => {
-  const raw = req.originalUrl.slice(PREFIX.length);
   let target;
   try {
-    target = new URL(raw);
+    target = parseProxyPath(req.originalUrl);
   } catch {
     return res.status(400).type('text/plain').send('Bad URL');
   }
@@ -840,7 +878,7 @@ server.on('upgrade', (req, socket, head) => {
   let target;
   if (req.url.startsWith(PREFIX)) {
     try {
-      target = new URL(req.url.slice(PREFIX.length));
+      target = parseProxyPath(req.url);
     } catch {
       return socket.destroy();
     }
