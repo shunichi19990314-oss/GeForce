@@ -11,6 +11,7 @@ const PORT = process.env.PORT || 8080;
 const ORIGIN = 'https://play.geforcenow.com';
 const PREFIX = '/__p/';
 const MARK = '/~';
+const PAGE_HDR = 'x-gfn-page';
 const REDIRECT_PATH = '/redirect/starfleet-oauth-redirect.html';
 const REDIRECT_PATHS = [
   '/redirect/starfleet-oauth-redirect.html',
@@ -93,7 +94,6 @@ function parseProxyPath(originalUrl) {
   return new URL('https://' + host + tail + search);
 }
 
-/* ブラウザが送ってきた Referer（プロキシURL）を実URLへ戻す */
 function realUrlFromProxy(u) {
   if (!u) return null;
   try {
@@ -406,9 +406,15 @@ const SHIM = String.raw`(function () {
         var url = isReq ? input.url : String(input);
         var t = norm(url);
         if (AUTH.test(hostOf(url))) log('sent ' + String(url).slice(0, 200));
+        var i2 = {};
+        var k;
+        for (k in (init || {})) i2[k] = init[k];
+        var hh = new Headers(i2.headers || (isReq ? input.headers : undefined));
+        hh.set('x-gfn-page', location.href);
+        i2.headers = hh;
         var p;
-        if (isReq) p = of.call(this, new Request(t, input), init);
-        else p = of.call(this, t, init);
+        if (isReq) p = of.call(this, new Request(t, input), i2);
+        else p = of.call(this, t, i2);
         return p.then(function (res) {
           if (watch(url)) {
             try {
@@ -433,7 +439,9 @@ const SHIM = String.raw`(function () {
     if (AUTH.test(hostOf(u))) log('sent ' + String(u).slice(0, 200));
     var a = Array.prototype.slice.call(arguments);
     a[1] = this.__t;
-    return xo.apply(this, a);
+    var r = xo.apply(this, a);
+    try { this.setRequestHeader('x-gfn-page', location.href); } catch (e) {}
+    return r;
   };
   XMLHttpRequest.prototype.send = function () {
     var self = this;
@@ -661,21 +669,28 @@ function proxyFor(origin) {
       proxyReq.setHeader('accept-encoding', 'identity');
       if (!proxyReq.getHeader('accept-language')) proxyReq.setHeader('accept-language', 'ja-JP,ja;q=0.9');
 
-      // 参照元を実URLに戻し、Origin / Sec-Fetch-Site をそれに合わせる
-      const ref = realUrlFromProxy(req.headers.referer);
+      let ref = realUrlFromProxy(req.headers[PAGE_HDR]) || realUrlFromProxy(req.headers.referer);
+      try {
+        proxyReq.removeHeader(PAGE_HDR);
+      } catch {}
+
+      let refOrigin = '';
       if (ref) {
-        proxyReq.setHeader('referer', ref);
         try {
-          const rHost = new URL(ref).hostname;
-          proxyReq.setHeader('origin', new URL(ref).origin);
-          proxyReq.setHeader('sec-fetch-site', siteOf(rHost) === siteOf(t.hostname) ? 'same-site' : 'cross-site');
+          refOrigin = new URL(ref).origin;
+          proxyReq.setHeader('referer', ref);
+          proxyReq.setHeader('origin', refOrigin);
+          proxyReq.setHeader('sec-fetch-site', siteOf(new URL(ref).hostname) === siteOf(t.hostname) ? 'same-site' : 'cross-site');
         } catch {
-          /* keep */
+          ref = null;
         }
-      } else {
+      }
+      if (!ref) {
+        refOrigin = t.origin;
         proxyReq.setHeader('referer', t.href);
         proxyReq.setHeader('origin', t.origin);
       }
+      req.__refOrigin = refOrigin;
 
       try {
         proxyReq.removeHeader('if-none-match');
@@ -689,9 +704,9 @@ function proxyFor(origin) {
           .filter(Boolean);
         srv(
           '[req] ' + req.method + ' ' + t.hostname + t.pathname +
-            ' o=' + (req.headers.origin || '-') +
-            ' r=' + String(req.headers.referer || '-').slice(-70) +
-            ' sfs=' + (req.headers['sec-fetch-site'] || '-') +
+            ' o=' + refOrigin +
+            ' r=' + String(ref || '-').slice(0, 90) +
+            ' sfs=' + (proxyReq.getHeader('sec-fetch-site') || '-') +
             ' ck=' + JSON.stringify(names)
         );
       }
@@ -736,7 +751,8 @@ function proxyFor(origin) {
         }
         h['set-cookie'] = arr.map(fixCookie(host));
       }
-      if (h['access-control-allow-origin']) h['access-control-allow-origin'] = req.headers.origin || '*';
+      if (h['access-control-allow-origin']) h['access-control-allow-origin'] = req.__refOrigin || req.headers.origin || '*';
+      if (h['access-control-allow-credentials']) h['access-control-allow-credentials'] = 'true';
 
       const ct = String(h['content-type'] || '').toLowerCase();
       const enc = String(h['content-encoding'] || '').toLowerCase();
