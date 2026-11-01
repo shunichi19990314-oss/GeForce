@@ -43,7 +43,6 @@ function isAllowed(abs) {
   }
 }
 
-/* ホスト名だけ難読化し、パス構造は保持する（相対解決のため） */
 function proxyUrl(absUrl) {
   const u = new URL(absUrl);
   const p = u.pathname && u.pathname.charAt(0) === '/' ? u.pathname : '/' + u.pathname;
@@ -235,6 +234,7 @@ const SHIM = String.raw`(function () {
   window.__GFN_PROXY_SHIM__ = true;
 
   var P = '/__p/';
+  var RU = 'https://play.geforcenow.com/redirect/starfleet-oauth-redirect.html';
   var AUTH = /(^|\.)(accounts\.nvgs\.nvidia\.com|login\.nvidia\.com|login\.nvgs\.nvidia\.com)$/i;
   var WATCH = /(^|\.)(accounts\.nvgs\.nvidia\.com|login\.nvidia\.com|login\.nvgs\.nvidia\.com|play\.geforcenow\.com|pcs\.geforcenow\.com)$/i;
 
@@ -312,9 +312,28 @@ const SHIM = String.raw`(function () {
   if (document.body) paint();
   else document.addEventListener('DOMContentLoaded', paint);
 
+  /* redirect_uri を正規値へ差し替える */
+  function fixRU(x) {
+    var s = String(x);
+    if (s.indexOf('redirect_uri=') < 0) return s;
+    return s.replace(/(redirect_uri=)([^&#]*)/gi, function (m, p, v) {
+      var d = v;
+      try { d = decodeURIComponent(v); } catch (e) {}
+      try {
+        var a = new URL(d, location.href);
+        if (a.hostname === location.hostname) {
+          log('redirectFixed ' + RU);
+          return p + encodeURIComponent(RU);
+        }
+      } catch (e) {}
+      return m;
+    });
+  }
+
   function norm(x) {
     try {
-      var a = new URL(String(x), document.baseURI || location.href);
+      var s = fixRU(x);
+      var a = new URL(s, document.baseURI || location.href);
       if (a.pathname.indexOf(P) === 0) return a.pathname + a.search + a.hash;
       if (a.origin === location.origin) return a.pathname + a.search + a.hash;
       if (a.protocol !== 'https:') return a.href;
@@ -400,7 +419,7 @@ const SHIM = String.raw`(function () {
   var oo = window.open;
   window.open = function (u) {
     var a = Array.prototype.slice.call(arguments);
-    if (u) { a[0] = norm(u); log('open ' + String(u).slice(0, 160)); }
+    if (u) { a[0] = norm(u); log('open ' + String(u).slice(0, 200)); }
     return oo.apply(window, a);
   };
 
