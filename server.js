@@ -22,8 +22,6 @@ const SKIP_PREFIX = ['data:', 'blob:', 'javascript:', 'mailto:', 'about:', 'tel:
 
 let SELF_HOST = '';
 
-/* ---------------- エンコード ---------------- */
-
 function b64u(s) {
   return Buffer.from(s, 'utf8').toString('base64url');
 }
@@ -45,9 +43,13 @@ function isAllowed(abs) {
   }
 }
 
+/* ホスト名だけ難読化し、パス構造は保持する（相対解決のため） */
 function proxyUrl(absUrl) {
   const u = new URL(absUrl);
-  return PREFIX + b64u(u.hostname) + '/' + b64u(u.pathname + u.search) + u.hash;
+  const p = u.pathname && u.pathname.charAt(0) === '/' ? u.pathname : '/' + u.pathname;
+  let out = PREFIX + b64u(u.hostname) + p;
+  if (u.search) out += '?q=' + b64u(u.search);
+  return out + u.hash;
 }
 
 function cookiePathFor(host) {
@@ -56,23 +58,23 @@ function cookiePathFor(host) {
 
 function parseProxyPath(originalUrl) {
   const rest = originalUrl.slice(PREFIX.length);
-  const qi = rest.indexOf('?');
-  const seg = qi < 0 ? rest : rest.slice(0, qi);
-  const extra = qi < 0 ? '' : rest.slice(qi);
+  if (/^https?:\/\//i.test(rest)) return new URL(rest);
 
-  // 旧形式 /__p/https://host/path
-  if (/^https?:\/\//i.test(seg)) {
-    return new URL(seg + extra);
-  }
-
-  const slash = seg.indexOf('/');
-  const hostSeg = slash < 0 ? seg : seg.slice(0, slash);
-  const pathSeg = slash < 0 ? '' : seg.slice(slash + 1);
+  const slash = rest.indexOf('/');
+  const hostSeg = slash < 0 ? rest : rest.slice(0, slash);
+  let tail = slash < 0 ? '/' : rest.slice(slash);
   const host = unb64u(hostSeg);
   if (!host) throw new Error('bad host');
-  let path = unb64u(pathSeg) || '/';
-  if (path.charAt(0) !== '/') path = '/' + path;
-  return new URL('https://' + host + path + extra);
+
+  let search = '';
+  const qi = tail.indexOf('?');
+  if (qi >= 0) {
+    const qs = tail.slice(qi + 1);
+    tail = tail.slice(0, qi);
+    search = qs.startsWith('q=') ? unb64u(qs.slice(2)) : '?' + qs;
+  }
+  if (tail.charAt(0) !== '/') tail = '/' + tail;
+  return new URL('https://' + host + tail + search);
 }
 
 /* ---------------- URL 変換 ---------------- */
@@ -84,6 +86,7 @@ function mapUrl(u, base) {
   const low = s.toLowerCase();
   for (const p of SKIP_PREFIX) if (low.startsWith(p)) return u;
   if (s.charAt(0) === '#') return u;
+  if (s.startsWith(PREFIX)) return u;
 
   let abs;
   try {
@@ -93,6 +96,7 @@ function mapUrl(u, base) {
   }
   if (abs.protocol !== 'https:') return u;
   if (BLOCK.test(abs.hostname)) return u;
+  if (abs.pathname.startsWith(PREFIX)) return abs.pathname + abs.search + abs.hash;
   if (SELF_HOST && abs.hostname === SELF_HOST) return abs.pathname + abs.search + abs.hash;
 
   return proxyUrl(abs.href);
@@ -311,9 +315,10 @@ const SHIM = String.raw`(function () {
   function norm(x) {
     try {
       var a = new URL(String(x), document.baseURI || location.href);
+      if (a.pathname.indexOf(P) === 0) return a.pathname + a.search + a.hash;
       if (a.origin === location.origin) return a.pathname + a.search + a.hash;
       if (a.protocol !== 'https:') return a.href;
-      return P + b64u(a.hostname) + '/' + b64u(a.pathname + a.search) + a.hash;
+      return P + b64u(a.hostname) + a.pathname + (a.search ? '?q=' + b64u(a.search) : '') + a.hash;
     } catch (e) { return x; }
   }
   function hostOf(x) {
@@ -471,8 +476,9 @@ const REDIRECT_HTML = `<!doctype html>
   function norm(x) {
     try {
       var a = new URL(x, location.href);
+      if (a.pathname.indexOf('/__p/') === 0) return a.pathname + a.search + a.hash;
       if (a.origin === location.origin) return a.pathname + a.search + a.hash;
-      return '/__p/' + b64u(a.hostname) + '/' + b64u(a.pathname + a.search) + a.hash;
+      return '/__p/' + b64u(a.hostname) + a.pathname + (a.search ? '?q=' + b64u(a.search) : '') + a.hash;
     } catch (e) { return x; }
   }
   var u = new URL(location.href);
