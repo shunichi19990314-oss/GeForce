@@ -10,6 +10,7 @@ const cheerio = require('cheerio');
 const PORT = process.env.PORT || 8080;
 const ORIGIN = 'https://play.geforcenow.com';
 const PREFIX = '/__p/';
+const MARK = '/~';
 const REDIRECT_PATH = '/redirect/starfleet-oauth-redirect.html';
 const REDIRECT_PATHS = [
   '/redirect/starfleet-oauth-redirect.html',
@@ -19,8 +20,15 @@ const REDIRECT_PATHS = [
 
 const BLOCK = /(^|\.)(doubleclick\.net|googletagmanager\.com|google-analytics\.com)$/i;
 const SKIP_PREFIX = ['data:', 'blob:', 'javascript:', 'mailto:', 'about:', 'tel:', 'chrome-extension:'];
+const AUTH_RE = /(^|\.)(accounts\.nvgs\.nvidia\.com|login\.nvidia\.com|login\.nvgs\.nvidia\.com)$/i;
 
 let SELF_HOST = '';
+const srvLog = [];
+
+function srv(s) {
+  srvLog.push(new Date().toISOString().slice(11, 19) + ' ' + s);
+  if (srvLog.length > 120) srvLog.shift();
+}
 
 function b64u(s) {
   return Buffer.from(s, 'utf8').toString('base64url');
@@ -43,28 +51,33 @@ function isAllowed(abs) {
   }
 }
 
+/* ドメイン階層チェーン（com / nvidia.com / nvgs.nvidia.com / ホスト） */
+function chainOf(host) {
+  const labels = String(host).toLowerCase().split('.').filter(Boolean);
+  const out = [];
+  for (let k = 1; k <= labels.length; k++) out.push(b64u(labels.slice(labels.length - k).join('.')));
+  return out;
+}
+
 function proxyUrl(absUrl) {
   const u = new URL(absUrl);
   const p = u.pathname && u.pathname.charAt(0) === '/' ? u.pathname : '/' + u.pathname;
-  let out = PREFIX + b64u(u.hostname) + p;
+  let out = PREFIX + chainOf(u.hostname).join('/') + MARK + p;
   if (u.search) out += '?q=' + b64u(u.search);
   return out + u.hash;
-}
-
-function cookiePathFor(host) {
-  return PREFIX + b64u(host) + '/';
 }
 
 function parseProxyPath(originalUrl) {
   const rest = originalUrl.slice(PREFIX.length);
   if (/^https?:\/\//i.test(rest)) return new URL(rest);
 
-  const slash = rest.indexOf('/');
-  const hostSeg = slash < 0 ? rest : rest.slice(0, slash);
-  let tail = slash < 0 ? '/' : rest.slice(slash);
-  const host = unb64u(hostSeg);
+  const mi = rest.indexOf(MARK);
+  if (mi < 0) throw new Error('bad url');
+  const segs = rest.slice(0, mi).split('/');
+  const host = unb64u(segs[segs.length - 1]);
   if (!host) throw new Error('bad host');
 
+  let tail = rest.slice(mi + MARK.length) || '/';
   let search = '';
   const qi = tail.indexOf('?');
   if (qi >= 0) {
@@ -112,11 +125,20 @@ function mapLocation(loc, target) {
 }
 
 function fixCookie(host) {
-  return (c) =>
-    String(c)
-      .replace(/;\s*domain=[^;]*/gi, '')
-      .replace(/;\s*path=[^;]*/gi, '')
-      .replace(/;\s*partitioned/gi, '') + '; Path=' + cookiePathFor(host);
+  return (c) => {
+    let path = PREFIX + chainOf(host).join('/') + MARK + '/';
+    const m = String(c).match(/;\s*domain=\.?([^;\s]+)/i);
+    if (m && m[1]) {
+      const d = m[1].trim().toLowerCase();
+      if (d && host.toLowerCase().endsWith(d)) path = PREFIX + chainOf(d).join('/') + '/';
+    }
+    return (
+      String(c)
+        .replace(/;\s*domain=[^;]*/gi, '')
+        .replace(/;\s*path=[^;]*/gi, '')
+        .replace(/;\s*partitioned/gi, '') + '; Path=' + path
+    );
+  };
 }
 
 function fixRedirectUri(str, selfHost) {
@@ -234,6 +256,7 @@ const SHIM = String.raw`(function () {
   window.__GFN_PROXY_SHIM__ = true;
 
   var P = '/__p/';
+  var M = '/~';
   var RU = 'https://play.geforcenow.com/redirect/starfleet-oauth-redirect.html';
   var AUTH = /(^|\.)(accounts\.nvgs\.nvidia\.com|login\.nvidia\.com|login\.nvgs\.nvidia\.com)$/i;
   var WATCH = /(^|\.)(accounts\.nvgs\.nvidia\.com|login\.nvidia\.com|login\.nvgs\.nvidia\.com|play\.geforcenow\.com|pcs\.geforcenow\.com)$/i;
@@ -241,6 +264,11 @@ const SHIM = String.raw`(function () {
   function b64u(s) {
     try { return btoa(unescape(encodeURIComponent(s))).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, ''); }
     catch (e) { return ''; }
+  }
+  function chain(h) {
+    var l = String(h).toLowerCase().split('.').filter(Boolean), out = [];
+    for (var k = 1; k <= l.length; k++) out.push(b64u(l.slice(l.length - k).join('.')));
+    return out.join('/');
   }
 
   var ON = localStorage.getItem('gfnDebug') !== '0';
@@ -312,7 +340,6 @@ const SHIM = String.raw`(function () {
   if (document.body) paint();
   else document.addEventListener('DOMContentLoaded', paint);
 
-  /* redirect_uri を正規値へ差し替える */
   function fixRU(x) {
     var s = String(x);
     if (s.indexOf('redirect_uri=') < 0) return s;
@@ -337,7 +364,7 @@ const SHIM = String.raw`(function () {
       if (a.pathname.indexOf(P) === 0) return a.pathname + a.search + a.hash;
       if (a.origin === location.origin) return a.pathname + a.search + a.hash;
       if (a.protocol !== 'https:') return a.href;
-      return P + b64u(a.hostname) + a.pathname + (a.search ? '?q=' + b64u(a.search) : '') + a.hash;
+      return P + chain(a.hostname) + M + a.pathname + (a.search ? '?q=' + b64u(a.search) : '') + a.hash;
     } catch (e) { return x; }
   }
   function hostOf(x) {
@@ -492,12 +519,17 @@ const REDIRECT_HTML = `<!doctype html>
     try { return btoa(unescape(encodeURIComponent(s))).replace(/\\+/g, '-').replace(/\\//g, '_').replace(/=+$/, ''); }
     catch (e) { return ''; }
   }
+  function chain(h) {
+    var l = String(h).toLowerCase().split('.').filter(Boolean), out = [];
+    for (var k = 1; k <= l.length; k++) out.push(b64u(l.slice(l.length - k).join('.')));
+    return out.join('/');
+  }
   function norm(x) {
     try {
       var a = new URL(x, location.href);
       if (a.pathname.indexOf('/__p/') === 0) return a.pathname + a.search + a.hash;
       if (a.origin === location.origin) return a.pathname + a.search + a.hash;
-      return '/__p/' + b64u(a.hostname) + a.pathname + (a.search ? '?q=' + b64u(a.search) : '') + a.hash;
+      return '/__p/' + chain(a.hostname) + '/~' + a.pathname + (a.search ? '?q=' + b64u(a.search) : '') + a.hash;
     } catch (e) { return x; }
   }
   var u = new URL(location.href);
@@ -618,6 +650,13 @@ function proxyFor(origin) {
         proxyReq.removeHeader('if-none-match');
         proxyReq.removeHeader('if-modified-since');
       } catch {}
+      if (AUTH_RE.test(t.hostname)) {
+        const names = String(req.headers.cookie || '')
+          .split(';')
+          .map((c) => c.trim().split('=')[0])
+          .filter(Boolean);
+        srv('[req] ' + req.method + ' ' + t.hostname + t.pathname + ' cookies=' + JSON.stringify(names));
+      }
     },
 
     async onProxyRes(proxyRes, req, res) {
@@ -644,7 +683,9 @@ function proxyFor(origin) {
 
       if (h.location) h.location = mapLocation(h.location, target);
       if (h['set-cookie']) {
-        h['set-cookie'] = (Array.isArray(h['set-cookie']) ? h['set-cookie'] : [h['set-cookie']]).map(fixCookie(host));
+        const arr = Array.isArray(h['set-cookie']) ? h['set-cookie'] : [h['set-cookie']];
+        h['set-cookie'] = arr.map(fixCookie(host));
+        if (AUTH_RE.test(host)) srv('[set] ' + host + ' ' + arr.length + ' cookie(s)');
       }
       if (h['access-control-allow-origin']) h['access-control-allow-origin'] = req.headers.origin || '*';
 
@@ -744,6 +785,12 @@ app.get('/__shim.js', (req, res) => {
   res.send(SHIM);
 });
 
+app.get('/__srvlog', (req, res) => {
+  res.type('text/plain; charset=utf-8');
+  res.setHeader('cache-control', 'no-store');
+  res.send(srvLog.join('\n') || '(empty)');
+});
+
 app.get('/__diag', (req, res) => {
   res.type('text/plain; charset=utf-8');
   res.setHeader('cache-control', 'no-store');
@@ -755,13 +802,14 @@ app.get('/__diag', (req, res) => {
 });
 
 app.get('/__clearcookies', (req, res) => {
-  const list = String(req.headers.cookie || '').split(';');
+  const names = String(req.headers.cookie || '')
+    .split(';')
+    .map((c) => c.split('=')[0].trim())
+    .filter(Boolean);
   const out = [];
-  for (const c of list) {
-    const name = c.split('=')[0].trim();
-    if (!name) continue;
-    out.push(name + '=; Path=/; Max-Age=0');
-    out.push(name + '=; Path=' + PREFIX + '; Max-Age=0');
+  for (const n of names) {
+    out.push(n + '=; Path=/; Max-Age=0');
+    out.push(n + '=; Path=' + PREFIX + '; Max-Age=0');
   }
   res.setHeader('set-cookie', out);
   res.type('text/plain').send('cleared ' + out.length);
